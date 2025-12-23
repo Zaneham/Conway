@@ -23,6 +23,8 @@ efficiently in the first place.
 
 Conway is a binary translator that dynamically converts RISC-V (RV64I) instructions to native x86-64 machine code. The translator operates at runtime, decoding RISC-V instructions and emitting equivalent x86-64 sequences.
 
+Please look at **ROADMAP.MD** for more information on future plans!
+
 ## Architecture
 
 ```
