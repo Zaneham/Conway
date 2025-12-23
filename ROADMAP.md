@@ -31,16 +31,16 @@ Status: **Complete.** Sign extension working properly. More tea.
 
 ---
 
-## Phase 3: Control Flow
+## Phase 3: Control Flow ✓
 
 Where things get interesting. Branches and jumps.
 
-- [ ] **Conditional branches**: beq, bne, blt, bge, bltu, bgeu
-- [ ] **Unconditional jumps**: jal, jalr
+- [x] **Conditional branches**: beq, bne, blt, bge, bltu, bgeu
+- [x] **Unconditional jumps**: jal, jalr
 - [ ] **Basic block detection**: Stop translating at branch boundaries
 - [ ] **Branch target calculation**: PC-relative addressing
 
-Status: **Not started.** This is where the real fun begins.
+Status: **Branches and jumps done.** 6/6 tests passing. Basic blocks coming next.
 
 ---
 
@@ -117,4 +117,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated after Phase 2 completion. Kettle's on.*
+*Last updated after Phase 3 (control flow). The code is jumping about nicely.*

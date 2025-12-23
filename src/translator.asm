@@ -16,6 +16,9 @@ RV_OP_OP_IMM    equ 0x13
 RV_OP_OP        equ 0x33
 RV_OP_LOAD      equ 0x03
 RV_OP_STORE     equ 0x23
+RV_OP_JAL       equ 0x6F        ; Jump and Link
+RV_OP_JALR      equ 0x67        ; Jump and Link Register
+RV_OP_BRANCH    equ 0x63        ; Conditional branches
 
 ; Funct3 for OP-IMM
 RV_F3_ADDI      equ 0x0
@@ -55,6 +58,14 @@ RV_F3_SB        equ 0x0
 RV_F3_SH        equ 0x1
 RV_F3_SW        equ 0x2
 RV_F3_SD        equ 0x3
+
+; Funct3 for branches
+RV_F3_BEQ       equ 0x0         ; Branch if Equal
+RV_F3_BNE       equ 0x1         ; Branch if Not Equal
+RV_F3_BLT       equ 0x4         ; Branch if Less Than (signed)
+RV_F3_BGE       equ 0x5         ; Branch if Greater or Equal (signed)
+RV_F3_BLTU      equ 0x6         ; Branch if Less Than Unsigned
+RV_F3_BGEU      equ 0x7         ; Branch if Greater or Equal Unsigned
 
 section .text
     global translate_instruction
@@ -97,6 +108,15 @@ translate_instruction:
 
     cmp eax, RV_OP_STORE
     je .store
+
+    cmp eax, RV_OP_JAL
+    je .jal
+
+    cmp eax, RV_OP_JALR
+    je .jalr
+
+    cmp eax, RV_OP_BRANCH
+    je .branch
 
     ; Unknown - emit INT3
     mov byte [r12], 0xCC
@@ -1144,6 +1164,273 @@ translate_instruction:
     jmp .calc_size
 
 ;==============================================================================
+; JAL - Jump and Link (J-type)
+; rd = PC + 4; PC = PC + imm
+; "Sometimes you just need to take a leap of faith" - but save where you were
+;
+; Calling convention: R15 = pointer to rv_pc
+;==============================================================================
+.jal:
+    call extract_j_type         ; ECX = rd, EAX = imm (sign-extended)
+
+    ; First, save the return address (PC + 4) to rd if rd != x0
+    test ecx, ecx
+    jz .jal_skip_rd
+
+    ; Emit: mov rax, [r15]      ; Load current PC
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x07      ; ModRM: [r15]
+    add r12, 3
+
+    ; Emit: add rax, 4          ; PC + 4
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xC0
+    mov byte [r12+3], 0x04
+    add r12, 4
+
+    ; Emit: mov [rbx + rd*8], rax
+    push rax                    ; Save imm
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x43
+    mov eax, ecx
+    shl eax, 3
+    mov [r12+3], al
+    add r12, 4
+    pop rax                     ; Restore imm
+
+.jal_skip_rd:
+    ; Now update PC = PC + imm
+    ; Emit: mov rcx, [r15]      ; Load current PC
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x0F
+    add r12, 3
+
+    ; Emit: add rcx, imm32
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x81
+    mov byte [r12+2], 0xC1
+    mov [r12+3], eax
+    add r12, 7
+
+    ; Emit: mov [r15], rcx      ; Store new PC
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x0F
+    add r12, 3
+
+    jmp .calc_size
+
+;==============================================================================
+; JALR - Jump and Link Register (I-type)
+; rd = PC + 4; PC = (rs1 + imm) & ~1
+;==============================================================================
+.jalr:
+    call extract_i_type         ; ECX = rd, EBX = rs1, EAX = imm
+
+    push rcx                    ; Save rd
+    push rax                    ; Save imm
+
+    ; Save return address (PC + 4) to rd if rd != x0
+    test ecx, ecx
+    jz .jalr_skip_rd
+
+    ; Emit: mov rax, [r15]
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x07
+    add r12, 3
+
+    ; Emit: add rax, 4
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xC0
+    mov byte [r12+3], 0x04
+    add r12, 4
+
+    ; Emit: mov [rbx + rd*8], rax
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x43
+    pop rax
+    push rax
+    mov eax, [rsp+8]            ; Get rd from stack
+    shl eax, 3
+    mov [r12+3], al
+    add r12, 4
+
+.jalr_skip_rd:
+    ; Compute target: (rs1 + imm) & ~1
+    ; Emit: mov rcx, [rbx + rs1*8]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x4B
+    mov eax, ebx
+    shl eax, 3
+    mov [r12+3], al
+    add r12, 4
+
+    ; Emit: add rcx, imm32
+    pop rax                     ; Get imm
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x81
+    mov byte [r12+2], 0xC1
+    mov [r12+3], eax
+    add r12, 7
+
+    ; Emit: and rcx, ~1 (clear lowest bit)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xE1
+    mov byte [r12+3], 0xFE      ; -2 = ~1
+    add r12, 4
+
+    ; Emit: mov [r15], rcx
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x0F
+    add r12, 3
+
+    pop rcx                     ; Clean up stack (rd)
+    jmp .calc_size
+
+;==============================================================================
+; BRANCH - Conditional branches (B-type)
+; if (condition) PC = PC + imm else PC = PC + 4
+; "To branch, or not to branch, that is the question"
+;==============================================================================
+.branch:
+    ; Extract funct3 to determine branch type
+    mov eax, r13d
+    shr eax, 12
+    and eax, 0x7
+    push rax                    ; Save funct3
+
+    call extract_b_type         ; ECX = rs2, EBX = rs1, EAX = imm
+
+    push rax                    ; Save imm
+
+    ; Emit: mov rax, [rbx + rs1*8]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x43
+    mov eax, ebx
+    shl eax, 3
+    mov [r12+3], al
+    add r12, 4
+
+    ; Emit: mov rcx, [rbx + rs2*8]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x4B
+    mov eax, ecx
+    shl eax, 3
+    mov [r12+3], al
+    add r12, 4
+
+    ; Emit: cmp rax, rcx
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xC8
+    add r12, 3
+
+    ; Now emit conditional jump based on funct3
+    ; We'll emit: jCC taken; mov rdx, 4; jmp done; taken: mov rdx, imm; done: ...
+    pop rax                     ; imm
+    pop rdx                     ; funct3
+
+    ; Emit conditional jump to taken (short jump, 2 bytes)
+    ; The "not taken" path is 10 bytes: mov rdx,4 (7) + jmp +3 (2) + nop (1)
+    cmp edx, RV_F3_BEQ
+    je .emit_beq
+    cmp edx, RV_F3_BNE
+    je .emit_bne
+    cmp edx, RV_F3_BLT
+    je .emit_blt
+    cmp edx, RV_F3_BGE
+    je .emit_bge
+    cmp edx, RV_F3_BLTU
+    je .emit_bltu
+    cmp edx, RV_F3_BGEU
+    je .emit_bgeu
+
+    ; Unknown branch - INT3
+    mov byte [r12], 0xCC
+    mov rax, 1
+    jmp .done
+
+.emit_beq:
+    mov byte [r12], 0x74        ; JE rel8
+    jmp .branch_common
+.emit_bne:
+    mov byte [r12], 0x75        ; JNE rel8
+    jmp .branch_common
+.emit_blt:
+    mov byte [r12], 0x7C        ; JL rel8 (signed)
+    jmp .branch_common
+.emit_bge:
+    mov byte [r12], 0x7D        ; JGE rel8 (signed)
+    jmp .branch_common
+.emit_bltu:
+    mov byte [r12], 0x72        ; JB rel8 (unsigned)
+    jmp .branch_common
+.emit_bgeu:
+    mov byte [r12], 0x73        ; JAE rel8 (unsigned)
+    jmp .branch_common
+
+.branch_common:
+    ; Jcc +10 (skip not-taken path)
+    mov byte [r12+1], 10
+    add r12, 2
+
+    ; Not taken: mov rdx, 4
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xC7
+    mov byte [r12+2], 0xC2
+    mov dword [r12+3], 4
+    add r12, 7
+
+    ; jmp +7 (skip taken path - mov rdx,imm is 7 bytes)
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 7
+    add r12, 2
+
+    ; nop for alignment
+    mov byte [r12], 0x90
+    add r12, 1
+
+    ; Taken: mov rdx, imm
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xC7
+    mov byte [r12+2], 0xC2
+    mov [r12+3], eax            ; imm
+    add r12, 7
+
+    ; Done: update PC
+    ; Emit: mov rax, [r15]      ; Current PC
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x07
+    add r12, 3
+
+    ; Emit: add rax, rdx        ; PC + offset (4 or imm)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xD0
+    add r12, 3
+
+    ; Emit: mov [r15], rax      ; Store new PC
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x07
+    add r12, 3
+
+    jmp .calc_size
+
+;==============================================================================
 ; NOP
 ;==============================================================================
 .emit_nop:
@@ -1269,4 +1556,110 @@ extract_s_type:
     sar eax, 20
     and eax, 0xFFFFFFE0
     or eax, edx
+    ret
+
+;==============================================================================
+; extract_j_type - J-type instruction format (JAL)
+; Input:  R13D = instruction
+; Output: ECX = rd, EAX = immediate (sign-extended, scaled by 2)
+;
+; J-type immediate: imm[20|10:1|11|19:12] - bits are scrambled!
+; Final imm = {inst[31], inst[19:12], inst[20], inst[30:21], 0}
+;==============================================================================
+extract_j_type:
+    ; rd = bits 11:7
+    mov eax, r13d
+    shr eax, 7
+    and eax, 0x1F
+    mov ecx, eax
+
+    ; Build the immediate from its scattered bits
+    ; imm[20]    = inst[31]
+    ; imm[10:1]  = inst[30:21]
+    ; imm[11]    = inst[20]
+    ; imm[19:12] = inst[19:12]
+
+    xor eax, eax
+
+    ; imm[19:12] = inst[19:12]
+    mov edx, r13d
+    and edx, 0x000FF000          ; Bits 19:12
+    or eax, edx
+
+    ; imm[11] = inst[20]
+    mov edx, r13d
+    shr edx, 9                   ; Bit 20 -> bit 11
+    and edx, 0x00000800
+    or eax, edx
+
+    ; imm[10:1] = inst[30:21]
+    mov edx, r13d
+    shr edx, 20                  ; Bits 30:21 -> bits 10:1
+    and edx, 0x000007FE
+    or eax, edx
+
+    ; imm[20] = inst[31] (sign bit)
+    mov edx, r13d
+    sar edx, 11                  ; Bit 31 -> bit 20
+    and edx, 0x00100000
+    or eax, edx
+
+    ; Sign-extend from bit 20
+    shl eax, 11
+    sar eax, 11
+
+    ret
+
+;==============================================================================
+; extract_b_type - B-type instruction format (branches)
+; Input:  R13D = instruction
+; Output: ECX = rs2, EBX = rs1, EAX = immediate (sign-extended, scaled by 2)
+;
+; B-type immediate: imm[12|10:5] rs2 rs1 funct3 imm[4:1|11] opcode
+; Final imm = {inst[31], inst[7], inst[30:25], inst[11:8], 0}
+;==============================================================================
+extract_b_type:
+    ; rs1 = bits 19:15
+    mov eax, r13d
+    shr eax, 15
+    and eax, 0x1F
+    mov ebx, eax
+
+    ; rs2 = bits 24:20
+    mov eax, r13d
+    shr eax, 20
+    and eax, 0x1F
+    mov ecx, eax
+
+    ; Build the immediate
+    xor eax, eax
+
+    ; imm[4:1] = inst[11:8]
+    mov edx, r13d
+    shr edx, 7                   ; Bits 11:8 -> bits 4:1
+    and edx, 0x0000001E
+    or eax, edx
+
+    ; imm[10:5] = inst[30:25]
+    mov edx, r13d
+    shr edx, 20                  ; Bits 30:25 -> bits 10:5
+    and edx, 0x000007E0
+    or eax, edx
+
+    ; imm[11] = inst[7]
+    mov edx, r13d
+    shl edx, 4                   ; Bit 7 -> bit 11
+    and edx, 0x00000800
+    or eax, edx
+
+    ; imm[12] = inst[31] (sign bit)
+    mov edx, r13d
+    sar edx, 19                  ; Bit 31 -> bit 12
+    and edx, 0x00001000
+    or eax, edx
+
+    ; Sign-extend from bit 12
+    shl eax, 19
+    sar eax, 19
+
     ret
