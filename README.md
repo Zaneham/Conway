@@ -45,6 +45,8 @@ Conway is a binary translator that dynamically converts RISC-V (RV64I) instructi
 
 ## Building
 
+Good on you for being brave! 
+
 Requires NASM and a linker (ld or link.exe on Windows).
 
 ```bash
