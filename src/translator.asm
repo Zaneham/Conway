@@ -69,6 +69,45 @@ RV_F3_BGEU      equ 0x7         ; Branch if Greater or Equal Unsigned
 
 section .text
     global translate_instruction
+    global translate_block
+    global lookup_block
+    global init_block_cache
+    global execute_blocks
+    global link_block
+    global block_cache
+    global code_buffer
+
+;==============================================================================
+; Block Cache Constants
+;==============================================================================
+BLOCK_CACHE_SIZE    equ 1024            ; Number of cache entries
+BLOCK_ENTRY_SIZE    equ 64              ; Bytes per entry
+CODE_BUFFER_SIZE    equ 1048576         ; 1MB code buffer
+
+; Block entry offsets
+BLOCK_VALID         equ 0               ; 1 byte: is entry valid?
+BLOCK_START_PC      equ 8               ; 8 bytes: RISC-V start PC
+BLOCK_CODE_PTR      equ 16              ; 8 bytes: pointer to x86 code
+BLOCK_CODE_SIZE     equ 24              ; 4 bytes: size of x86 code
+BLOCK_EXIT_TYPE     equ 28              ; 4 bytes: how block exits
+BLOCK_NEXT_PC       equ 32              ; 8 bytes: unconditional target
+BLOCK_TAKEN_PC      equ 40              ; 8 bytes: branch taken target
+BLOCK_NOT_TAKEN_PC  equ 48              ; 8 bytes: branch not-taken target
+; 56-63: padding to 64 bytes
+
+; Exit types
+EXIT_NONE           equ 0               ; Block doesn't exit (incomplete)
+EXIT_JUMP           equ 1               ; Unconditional jump (JAL/JALR)
+EXIT_BRANCH         equ 2               ; Conditional branch
+EXIT_INDIRECT       equ 3               ; Indirect jump (JALR with register)
+
+section .bss
+    alignb 4096
+    block_cache:    resb BLOCK_CACHE_SIZE * BLOCK_ENTRY_SIZE    ; 64KB cache
+    code_buffer:    resb CODE_BUFFER_SIZE                        ; 1MB code
+    code_buf_ptr:   resq 1                                       ; Allocation pointer
+
+section .text
 
 ;==============================================================================
 ; translate_instruction
@@ -1393,9 +1432,9 @@ translate_instruction:
     mov dword [r12+3], 4
     add r12, 7
 
-    ; jmp +7 (skip taken path - mov rdx,imm is 7 bytes)
+    ; jmp +8 (skip taken path - nop is 1 byte + mov rdx,imm is 7 bytes = 8)
     mov byte [r12], 0xEB
-    mov byte [r12+1], 7
+    mov byte [r12+1], 8
     add r12, 2
 
     ; nop for alignment
@@ -1662,4 +1701,396 @@ extract_b_type:
     shl eax, 19
     sar eax, 19
 
+    ret
+
+;==============================================================================
+; init_block_cache
+; Initialise the block cache - call once at startup
+; Input:  none
+; Output: none
+; "Have you tried turning it off and on again?"
+;==============================================================================
+init_block_cache:
+    push rbx
+    push rcx
+    push rdi                        ; Callee-saved on Windows
+
+    ; Zero out the block cache (mark all entries invalid)
+    lea rdi, [block_cache]
+    mov rcx, BLOCK_CACHE_SIZE * BLOCK_ENTRY_SIZE / 8
+    xor eax, eax
+    rep stosq
+
+    ; Initialise code buffer pointer to start of buffer
+    lea rax, [code_buffer]
+    mov [code_buf_ptr], rax
+
+    pop rdi
+    pop rcx
+    pop rbx
+    ret
+
+;==============================================================================
+; lookup_block
+; Find a cached block by PC
+; Input:  RDI = RISC-V PC to look up
+; Output: RAX = pointer to block entry, or 0 if not found
+;==============================================================================
+lookup_block:
+    push rbx
+
+    ; Hash: PC & (BLOCK_CACHE_SIZE - 1) = PC & 0x3FF
+    mov rax, rdi
+    and eax, (BLOCK_CACHE_SIZE - 1)
+
+    ; Calculate entry address: block_cache + (hash * BLOCK_ENTRY_SIZE)
+    shl eax, 6                      ; * 64
+    lea rbx, [block_cache]
+    add rbx, rax
+
+    ; Check if valid and PC matches
+    cmp byte [rbx + BLOCK_VALID], 1
+    jne .not_found
+
+    cmp [rbx + BLOCK_START_PC], rdi
+    jne .not_found
+
+    ; Found it!
+    mov rax, rbx
+    pop rbx
+    ret
+
+.not_found:
+    xor eax, eax
+    pop rbx
+    ret
+
+;==============================================================================
+; translate_block
+; Translate a basic block starting at given PC
+; Input:  RDI = start PC
+;         RSI = pointer to RISC-V memory (guest memory)
+; Output: RAX = pointer to block entry
+;
+; Translates instructions until a branch/jump, caches the result
+;==============================================================================
+translate_block:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov [rbp-8], rdi                ; Save start PC
+    mov [rbp-16], rsi               ; Save guest memory pointer
+
+    ; First, check if already cached
+    call lookup_block
+    test rax, rax
+    jnz .already_cached
+
+    ; Not cached - need to translate
+    mov rdi, [rbp-8]                ; Restore start PC
+    mov rsi, [rbp-16]               ; Restore guest memory
+
+    ; Get a cache slot (hash the PC)
+    mov rax, rdi
+    and eax, (BLOCK_CACHE_SIZE - 1)
+    shl eax, 6
+    lea r15, [block_cache]
+    add r15, rax                    ; R15 = cache entry pointer
+
+    ; Allocate space in code buffer
+    mov r12, [code_buf_ptr]         ; R12 = output pointer (start of this block)
+    mov [r15 + BLOCK_CODE_PTR], r12
+
+    ; Store start PC
+    mov rax, [rbp-8]
+    mov [r15 + BLOCK_START_PC], rax
+
+    ; R13 = current PC, R14 = guest memory base
+    mov r13, [rbp-8]
+    mov r14, [rbp-16]
+
+    ; R8 = instruction count (safety limit)
+    xor r8d, r8d
+
+.translate_loop:
+    ; Safety: max 256 instructions per block
+    cmp r8d, 256
+    jge .end_block_fallthrough
+    inc r8d
+
+    ; Fetch instruction from guest memory at current PC
+    mov eax, [r14 + r13]            ; Load 32-bit instruction
+    mov [rbp-24], eax               ; Save instruction
+
+    ; Check if this is a block-ending instruction BEFORE translating
+    mov ecx, eax
+    and ecx, 0x7F                   ; Extract opcode
+
+    cmp ecx, RV_OP_JAL
+    je .is_jal
+
+    cmp ecx, RV_OP_JALR
+    je .is_jalr
+
+    cmp ecx, RV_OP_BRANCH
+    je .is_branch
+
+    ; Not a block-ender - translate normally
+    mov edi, eax                    ; instruction
+    mov rsi, r12                    ; output buffer
+    call translate_instruction
+    add r12, rax                    ; Advance output pointer
+
+    ; Advance PC by 4
+    add r13, 4
+    jmp .translate_loop
+
+.is_jal:
+    ; JAL - unconditional jump
+    ; First, emit code to store current PC to rv_pc
+    ; Emit: mov qword [r15], current_pc
+    mov byte [r12], 0x49        ; REX.WB
+    mov byte [r12+1], 0xC7      ; MOV r/m64, imm32
+    mov byte [r12+2], 0x07      ; ModRM: [r15]
+    mov [r12+3], r13d           ; Current PC (32-bit immediate)
+    add r12, 7
+
+    ; Now translate the JAL
+    mov edi, [rbp-24]
+    mov rsi, r12
+    call translate_instruction
+    add r12, rax
+
+    ; Extract the target PC (PC + imm)
+    mov edi, [rbp-24]
+    push r13
+    mov r13d, edi                   ; Temporarily set R13D for extract_j_type
+    call extract_j_type             ; EAX = immediate
+    pop r13
+
+    add rax, r13                    ; target = current_pc + imm
+    mov [r15 + BLOCK_NEXT_PC], rax
+    mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_JUMP
+    jmp .finish_block
+
+.is_jalr:
+    ; JALR - indirect jump (we can't know target statically)
+    ; First, emit code to store current PC to rv_pc
+    ; Emit: mov qword [r15], current_pc
+    mov byte [r12], 0x49        ; REX.WB
+    mov byte [r12+1], 0xC7      ; MOV r/m64, imm32
+    mov byte [r12+2], 0x07      ; ModRM: [r15]
+    mov [r12+3], r13d           ; Current PC (32-bit immediate)
+    add r12, 7
+
+    ; Now translate the JALR
+    mov edi, [rbp-24]
+    mov rsi, r12
+    call translate_instruction
+    add r12, rax
+
+    mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_INDIRECT
+    mov qword [r15 + BLOCK_NEXT_PC], 0
+    jmp .finish_block
+
+.is_branch:
+    ; Conditional branch
+    ; First, emit code to store current PC to rv_pc
+    ; Emit: mov qword [r15], current_pc
+    mov byte [r12], 0x49        ; REX.WB
+    mov byte [r12+1], 0xC7      ; MOV r/m64, imm32
+    mov byte [r12+2], 0x07      ; ModRM: [r15]
+    mov [r12+3], r13d           ; Current PC (32-bit immediate)
+    add r12, 7
+
+    ; Now translate the branch
+    mov edi, [rbp-24]
+    mov rsi, r12
+    call translate_instruction
+    add r12, rax
+
+    ; Extract branch target
+    mov edi, [rbp-24]
+    push r13
+    mov r13d, edi
+    call extract_b_type             ; ECX = rs1, EBX = rs2, EAX = imm
+    pop r13
+
+    ; Taken target = PC + imm
+    add rax, r13
+    mov [r15 + BLOCK_TAKEN_PC], rax
+
+    ; Not-taken target = PC + 4
+    lea rax, [r13 + 4]
+    mov [r15 + BLOCK_NOT_TAKEN_PC], rax
+
+    mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_BRANCH
+    jmp .finish_block
+
+.end_block_fallthrough:
+    ; Hit instruction limit - fall through to next instruction
+    mov [r15 + BLOCK_NEXT_PC], r13
+    mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_JUMP
+
+.finish_block:
+    ; Emit block epilogue: RET to return to executor
+    mov byte [r12], 0xC3
+    inc r12
+
+    ; Calculate and store code size
+    mov rax, r12
+    sub rax, [r15 + BLOCK_CODE_PTR]
+    mov [r15 + BLOCK_CODE_SIZE], eax
+
+    ; Update code buffer allocation pointer
+    mov [code_buf_ptr], r12
+
+    ; Mark entry as valid
+    mov byte [r15 + BLOCK_VALID], 1
+
+    ; Return pointer to block entry
+    mov rax, r15
+
+.already_cached:
+    ; RAX already has block pointer
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    add rsp, 64
+    pop rbp
+    ret
+
+;==============================================================================
+; execute_blocks
+; Main execution loop - runs blocks until a stopping condition
+; Input:  RDI = starting PC
+;         RSI = pointer to guest memory
+;         RDX = pointer to rv_regs array
+;         RCX = pointer to rv_pc
+;         R8  = max blocks to execute (0 = unlimited)
+; Output: RAX = final PC value
+;
+; "Round and round the blocks we go, where we stop, nobody knows"
+;==============================================================================
+execute_blocks:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 80
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Save parameters
+    mov [rbp-8], rdi            ; start PC
+    mov [rbp-16], rsi           ; guest memory
+    mov [rbp-24], rdx           ; rv_regs
+    mov [rbp-32], rcx           ; rv_pc pointer
+    mov [rbp-40], r8            ; max blocks
+
+    ; Set initial PC
+    mov rax, rdi
+    mov rcx, [rbp-32]
+    mov [rcx], rax
+
+    ; R12 = block count
+    xor r12d, r12d
+
+.exec_loop:
+    ; Check block limit
+    mov rax, [rbp-40]
+    test rax, rax
+    jz .no_limit
+    cmp r12, rax
+    jge .done
+.no_limit:
+    inc r12
+
+    ; Get current PC
+    mov rcx, [rbp-32]
+    mov rdi, [rcx]              ; RDI = current PC
+
+    ; Translate/lookup block
+    mov rsi, [rbp-16]           ; guest memory
+    call translate_block
+    test rax, rax
+    jz .done                    ; No block = stop
+
+    mov [rbp-48], rax           ; Save block pointer
+
+    ; Set up execution state
+    mov rbx, [rbp-24]           ; RBX = rv_regs
+    mov r15, [rbp-32]           ; R15 = rv_pc pointer
+    mov r14, [rbp-16]           ; R14 = guest memory (for loads/stores)
+
+    ; Get code pointer and execute
+    mov rax, [rbp-48]
+    mov rax, [rax + BLOCK_CODE_PTR]
+    call rax
+
+    ; Block executed, PC has been updated
+    ; Check if we should continue (indirect jumps return 0 in next_pc)
+    mov rax, [rbp-48]
+    cmp dword [rax + BLOCK_EXIT_TYPE], EXIT_INDIRECT
+    je .check_indirect
+
+    ; For direct jumps/branches, continue
+    jmp .exec_loop
+
+.check_indirect:
+    ; For indirect jumps, PC is already set by the block
+    ; Continue execution from new PC
+    jmp .exec_loop
+
+.done:
+    ; Return final PC
+    mov rcx, [rbp-32]
+    mov rax, [rcx]
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    add rsp, 80
+    pop rbp
+    ret
+
+;==============================================================================
+; link_block
+; Patch a block's exit to jump directly to another block
+; Input:  RDI = source block pointer
+;         RSI = slot (0 = primary/taken, 1 = not-taken)
+;         RDX = target block pointer
+; Output: RAX = 1 if linked, 0 if failed
+;
+; This patches the RET at the end of the block with a JMP to the target.
+; Note: Current implementation uses RET, so this is for future optimization.
+;==============================================================================
+link_block:
+    ; For now, just record the link in the block entry
+    ; Future: actually patch the code
+
+    test rsi, rsi
+    jnz .link_not_taken
+
+.link_taken:
+    ; Store taken link
+    mov [rdi + BLOCK_TAKEN_PC], rdx
+    mov eax, 1
+    ret
+
+.link_not_taken:
+    ; Store not-taken link
+    mov [rdi + BLOCK_NOT_TAKEN_PC], rdx
+    mov eax, 1
     ret

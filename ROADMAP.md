@@ -37,10 +37,12 @@ Where things get interesting. Branches and jumps.
 
 - [x] **Conditional branches**: beq, bne, blt, bge, bltu, bgeu
 - [x] **Unconditional jumps**: jal, jalr
-- [ ] **Basic block detection**: Stop translating at branch boundaries
-- [ ] **Branch target calculation**: PC-relative addressing
+- [x] **Basic block detection**: Stop translating at branch boundaries
+- [x] **Branch target calculation**: PC-relative addressing
+- [x] **Block caching**: 1024-entry cache with hash lookup
+- [x] **Execute loop**: Run multiple blocks in sequence
 
-Status: **Branches and jumps done.** 6/6 tests passing. Basic blocks coming next.
+Status: **Complete.** Full block caching implemented. The code is jumping about properly now.
 
 ---
 
@@ -73,12 +75,13 @@ Status: **Not started.** Will require a stiff drink.
 
 Make it fast. Or at least faster.
 
-- [ ] **Block caching**: Don't re-translate the same code
+- [x] **Block caching**: Don't re-translate the same code *(moved to Phase 3)*
+- [ ] **Block linking**: Patch exits to jump directly between blocks
 - [ ] **Hot path detection**: Identify frequently-executed blocks
 - [ ] **Register allocation**: Map hot RISC-V regs to x86 regs
 - [ ] **Peephole optimisation**: Combine common instruction sequences
 
-Status: **Not started.** Premature optimisation is the root of all evil, but we'll get here eventually.
+Status: **Partially done.** Block caching complete. Further optimisations await.
 
 ---
 
@@ -117,4 +120,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated after Phase 3 (control flow). The code is jumping about nicely.*
+*Last updated after Phase 3 completion. Block caching is in, branches work both ways, and we're ready for Phase 4.*
