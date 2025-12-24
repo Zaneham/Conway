@@ -46,15 +46,16 @@ Status: **Complete.** Full block caching implemented. The code is jumping about 
 
 ---
 
-## Phase 4: System
+## Phase 4: System ✓
 
 The bits that make it actually useful.
 
-- [ ] **ECALL/EBREAK**: System call interface
-- [ ] **CSR instructions**: Control and status registers (basic set)
-- [ ] **Fence instructions**: Memory ordering (likely NOPs on x86)
+- [x] **ECALL/EBREAK**: System call interface (exit syscall terminates execution)
+- [x] **CSR instructions**: Control and status registers (stub returning 0 - we're a teapot)
+- [x] **Fence instructions**: Memory ordering (NOPs on x86, as predicted)
+- [x] **High register fix**: Displacement encoding for x16-x31 now uses 32-bit offsets
 
-Status: **Not started.**
+Status: **Complete.** The machine can now politely request to exit. Jolly good.
 
 ---
 
@@ -120,4 +121,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated after Phase 3 completion. Block caching is in, branches work both ways, and we're ready for Phase 4.*
+*Last updated after Phase 4 completion. The translator now handles system calls, CSRs (sort of), and memory fences. Onwards to ELF loading, where we shall parse headers like a civilised person.*

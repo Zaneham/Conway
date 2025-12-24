@@ -19,6 +19,8 @@ RV_OP_STORE     equ 0x23
 RV_OP_JAL       equ 0x6F        ; Jump and Link
 RV_OP_JALR      equ 0x67        ; Jump and Link Register
 RV_OP_BRANCH    equ 0x63        ; Conditional branches
+RV_OP_SYSTEM    equ 0x73        ; ECALL, EBREAK, CSR instructions
+RV_OP_MISC_MEM  equ 0x0F        ; FENCE, FENCE.I
 
 ; Funct3 for OP-IMM
 RV_F3_ADDI      equ 0x0
@@ -67,6 +69,19 @@ RV_F3_BGE       equ 0x5         ; Branch if Greater or Equal (signed)
 RV_F3_BLTU      equ 0x6         ; Branch if Less Than Unsigned
 RV_F3_BGEU      equ 0x7         ; Branch if Greater or Equal Unsigned
 
+; Funct3 for SYSTEM (CSR instructions)
+RV_F3_PRIV      equ 0x0         ; ECALL, EBREAK, etc.
+RV_F3_CSRRW     equ 0x1         ; CSR Read/Write
+RV_F3_CSRRS     equ 0x2         ; CSR Read/Set
+RV_F3_CSRRC     equ 0x3         ; CSR Read/Clear
+RV_F3_CSRRWI    equ 0x5         ; CSR Read/Write Immediate
+RV_F3_CSRRSI    equ 0x6         ; CSR Read/Set Immediate
+RV_F3_CSRRCI    equ 0x7         ; CSR Read/Clear Immediate
+
+; SYSTEM instruction immediate values (bits 31:20)
+RV_SYS_ECALL    equ 0x000       ; Environment call
+RV_SYS_EBREAK   equ 0x001       ; Breakpoint
+
 section .text
     global translate_instruction
     global translate_block
@@ -100,6 +115,7 @@ EXIT_NONE           equ 0               ; Block doesn't exit (incomplete)
 EXIT_JUMP           equ 1               ; Unconditional jump (JAL/JALR)
 EXIT_BRANCH         equ 2               ; Conditional branch
 EXIT_INDIRECT       equ 3               ; Indirect jump (JALR with register)
+EXIT_ECALL          equ 4               ; System call (needs handler)
 
 section .bss
     alignb 4096
@@ -156,6 +172,12 @@ translate_instruction:
 
     cmp eax, RV_OP_BRANCH
     je .branch
+
+    cmp eax, RV_OP_SYSTEM
+    je .system
+
+    cmp eax, RV_OP_MISC_MEM
+    je .fence
 
     ; Unknown - emit INT3
     mov byte [r12], 0xCC
@@ -1470,6 +1492,129 @@ translate_instruction:
     jmp .calc_size
 
 ;==============================================================================
+; SYSTEM (ECALL, EBREAK, CSR)
+;==============================================================================
+.system:
+    ; Extract funct3
+    mov eax, r13d
+    shr eax, 12
+    and eax, 0x7
+
+    cmp eax, RV_F3_PRIV
+    je .system_priv
+
+    ; CSR instructions - dispatch by funct3
+    cmp eax, RV_F3_CSRRW
+    je .csrrw
+    cmp eax, RV_F3_CSRRS
+    je .csrrs
+    cmp eax, RV_F3_CSRRC
+    je .csrrc
+    cmp eax, RV_F3_CSRRWI
+    je .csrrwi
+    cmp eax, RV_F3_CSRRSI
+    je .csrrsi
+    cmp eax, RV_F3_CSRRCI
+    je .csrrci
+
+    ; Unknown SYSTEM instruction
+    mov byte [r12], 0xCC
+    mov rax, 1
+    jmp .done
+
+.system_priv:
+    ; Check immediate field for ECALL vs EBREAK
+    mov eax, r13d
+    shr eax, 20
+    and eax, 0xFFF
+
+    cmp eax, RV_SYS_ECALL
+    je .ecall
+    cmp eax, RV_SYS_EBREAK
+    je .ebreak
+
+    ; Unknown privileged instruction - emit INT3
+    mov byte [r12], 0xCC
+    mov rax, 1
+    jmp .done
+
+.ecall:
+    ; ECALL - System call
+    ; The syscall number is in a7 (x17), args in a0-a5 (x10-x15)
+    ; We just return to the executor which will handle it
+    ; First, update PC to point to next instruction (PC + 4)
+    ; Emit: mov rax, [r15]
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x07
+    add r12, 3
+
+    ; Emit: add rax, 4
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xC0
+    mov byte [r12+3], 0x04
+    add r12, 4
+
+    ; Emit: mov [r15], rax
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x07
+    add r12, 3
+
+    ; Return - the executor will check for ECALL exit type
+    jmp .calc_size
+
+.ebreak:
+    ; EBREAK - Debugger breakpoint
+    ; Emit INT3 for debugging
+    mov byte [r12], 0xCC
+    mov rax, 1
+    jmp .done
+
+;==============================================================================
+; CSR Instructions
+; For now, we'll implement a simple stub that ignores writes and returns 0
+; Real implementation would need a CSR array
+;==============================================================================
+.csrrw:
+.csrrs:
+.csrrc:
+.csrrwi:
+.csrrsi:
+.csrrci:
+    ; Extract rd
+    mov eax, r13d
+    shr eax, 7
+    and eax, 0x1F
+
+    ; If rd != 0, write 0 to it (stub implementation)
+    test eax, eax
+    jz .csr_done
+
+    ; Emit: mov qword [rbx + rd*8], 0
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xC7
+    mov byte [r12+2], 0x43
+    shl eax, 3
+    mov [r12+3], al
+    mov dword [r12+4], 0
+    add r12, 8
+
+.csr_done:
+    jmp .calc_size
+
+;==============================================================================
+; FENCE - Memory ordering (NOP on x86)
+;==============================================================================
+.fence:
+    ; x86 has strong memory ordering, so FENCE is a NOP
+    ; Just emit a NOP for clarity
+    mov byte [r12], 0x90
+    mov rax, 1
+    jmp .done
+
+;==============================================================================
 ; NOP
 ;==============================================================================
 .emit_nop:
@@ -1498,13 +1643,30 @@ translate_instruction:
 ; Expects: EBX = rs1
 ;==============================================================================
 emit_load_rs1:
+    ; Load [RBX + rs1*8] into RAX
+    ; EBX = rs1
+    mov eax, ebx
+    shl eax, 3              ; eax = rs1 * 8
+
+    ; Check if displacement fits in 8 bits (signed: -128 to 127)
+    cmp eax, 127
+    jg .load_disp32
+
+    ; 8-bit displacement: mov rax, [rbx + disp8]
     mov byte [r12], 0x48
     mov byte [r12+1], 0x8B
-    mov byte [r12+2], 0x43
-    mov eax, ebx
-    shl eax, 3
+    mov byte [r12+2], 0x43      ; ModRM: [rbx + disp8]
     mov [r12+3], al
     add r12, 4
+    ret
+
+.load_disp32:
+    ; 32-bit displacement: mov rax, [rbx + disp32]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x83      ; ModRM: [rbx + disp32]
+    mov [r12+3], eax
+    add r12, 7
     ret
 
 ;==============================================================================
@@ -1512,14 +1674,31 @@ emit_load_rs1:
 ; Expects: ECX = rd
 ;==============================================================================
 emit_store_rd:
+    ; Store RAX to [RBX + rd*8]
+    ; ECX = rd
     mov r15d, ecx
+    mov eax, ecx
+    shl eax, 3              ; eax = rd * 8
+
+    ; Check if displacement fits in 8 bits (signed: -128 to 127)
+    cmp eax, 127
+    jg .store_disp32
+
+    ; 8-bit displacement: mov [rbx + disp8], rax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x89
-    mov byte [r12+2], 0x43
-    mov eax, ecx
-    shl eax, 3
+    mov byte [r12+2], 0x43      ; ModRM: [rbx + disp8]
     mov [r12+3], al
     add r12, 4
+    ret
+
+.store_disp32:
+    ; 32-bit displacement: mov [rbx + disp32], rax
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x83      ; ModRM: [rbx + disp32]
+    mov [r12+3], eax
+    add r12, 7
     ret
 
 ;==============================================================================
@@ -1841,6 +2020,9 @@ translate_block:
     cmp ecx, RV_OP_BRANCH
     je .is_branch
 
+    cmp ecx, RV_OP_SYSTEM
+    je .check_ecall
+
     ; Not a block-ender - translate normally
     mov edi, eax                    ; instruction
     mov rsi, r12                    ; output buffer
@@ -1931,6 +2113,50 @@ translate_block:
     mov [r15 + BLOCK_NOT_TAKEN_PC], rax
 
     mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_BRANCH
+    jmp .finish_block
+
+.check_ecall:
+    ; Check if this is actually ECALL (funct3=0, imm=0)
+    ; or EBREAK (funct3=0, imm=1)
+    ; CSR instructions (funct3 != 0) are NOT block-enders
+    mov eax, [rbp-24]
+    shr eax, 12
+    and eax, 0x7                    ; funct3
+    test eax, eax
+    jnz .not_block_ender            ; CSR instructions - not block-enders
+
+    ; It's ECALL or EBREAK - these ARE block-enders
+    jmp .is_ecall
+
+.not_block_ender:
+    ; This is a CSR instruction, translate normally
+    mov edi, [rbp-24]
+    mov rsi, r12
+    call translate_instruction
+    add r12, rax
+    add r13, 4
+    jmp .translate_loop
+
+.is_ecall:
+    ; ECALL/EBREAK - block-ending instruction
+    ; First, emit code to store current PC to rv_pc
+    mov byte [r12], 0x49        ; REX.WB
+    mov byte [r12+1], 0xC7      ; MOV r/m64, imm32
+    mov byte [r12+2], 0x07      ; ModRM: [r15]
+    mov [r12+3], r13d           ; Current PC (32-bit immediate)
+    add r12, 7
+
+    ; Translate the ECALL/EBREAK
+    mov edi, [rbp-24]
+    mov rsi, r12
+    call translate_instruction
+    add r12, rax
+
+    ; Next PC = current PC + 4
+    lea rax, [r13 + 4]
+    mov [r15 + BLOCK_NEXT_PC], rax
+
+    mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_ECALL
     jmp .finish_block
 
 .end_block_fallthrough:
@@ -2038,9 +2264,14 @@ execute_blocks:
     call rax
 
     ; Block executed, PC has been updated
-    ; Check if we should continue (indirect jumps return 0 in next_pc)
+    ; Check exit type
     mov rax, [rbp-48]
-    cmp dword [rax + BLOCK_EXIT_TYPE], EXIT_INDIRECT
+    mov ecx, [rax + BLOCK_EXIT_TYPE]
+
+    cmp ecx, EXIT_ECALL
+    je .handle_ecall
+
+    cmp ecx, EXIT_INDIRECT
     je .check_indirect
 
     ; For direct jumps/branches, continue
@@ -2049,6 +2280,38 @@ execute_blocks:
 .check_indirect:
     ; For indirect jumps, PC is already set by the block
     ; Continue execution from new PC
+    jmp .exec_loop
+
+.handle_ecall:
+    ; ECALL - handle system call
+    ; Syscall number is in a7 (x17), args in a0-a5 (x10-x15)
+    mov rbx, [rbp-24]           ; rv_regs
+
+    ; Get syscall number from a7 (x17)
+    mov rax, [rbx + 17*8]
+
+    ; Check for exit (93)
+    cmp rax, 93
+    je .syscall_exit
+
+    ; Check for write (64)
+    cmp rax, 64
+    je .syscall_write
+
+    ; Unknown syscall - just continue
+    jmp .exec_loop
+
+.syscall_exit:
+    ; exit(status) - a0 = exit code
+    ; We just stop execution and return
+    jmp .done
+
+.syscall_write:
+    ; write(fd, buf, count) - a0=fd, a1=buf, a2=count
+    ; For now, we'll just simulate success by returning count in a0
+    ; Real implementation would call WriteConsoleA
+    mov rax, [rbx + 12*8]       ; a2 = count
+    mov [rbx + 10*8], rax       ; a0 = return value (bytes written)
     jmp .exec_loop
 
 .done:
