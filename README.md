@@ -23,27 +23,27 @@ efficiently in the first place.
 
 Conway is a binary translator that dynamically converts RISC-V (RV64I) instructions to native x86-64 machine code. The translator operates at runtime, decoding RISC-V instructions and emitting equivalent x86-64 sequences.
 
-Please look at **ROADMAP.MD** for more information on future plans!
+It can load and execute real RISC-V ELF binaries. Yes, actual cross-compiled programmes. We were surprised too.
+
+Please look at **ROADMAP.md** for more information on future plans!
 
 ## Architecture
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Decode    │────▶│  Dispatch   │────▶│    Emit     │
-│  (decode)   │     │ (dispatch)  │     │   (emit)    │
+│ ELF Loader  │────▶│ Translator  │────▶│ Block Cache │
+│             │     │             │     │             │
 └─────────────┘     └─────────────┘     └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │   Runtime   │
-                    │  (runtime)  │
-                    └─────────────┘
+                           │                   │
+                           ▼                   ▼
+                    ┌─────────────┐     ┌─────────────┐
+                    │   Decode    │     │   Execute   │
+                    │   & Emit    │     │    Loop     │
+                    └─────────────┘     └─────────────┘
 ```
 
-- **decode.asm** - Parses RISC-V instruction encoding, extracts opcode, registers, and immediates
-- **dispatch.asm** - Routes decoded instructions to appropriate emission handlers
-- **emit.asm** - Generates x86-64 machine code sequences
-- **runtime.asm** - Manages execution context, register mapping, and memory
+- **elf_loader.asm** - Parses ELF64 headers and loads PT_LOAD segments into guest memory
+- **translator.asm** - The whole shebang: decode, emit, block cache, and execution loop
 
 ## Building
 
@@ -61,6 +61,23 @@ make
 ./conway <riscv_binary>
 ```
 
+## Cross-Compiling RISC-V Binaries
+
+Don't have a RISC-V toolchain? Docker to the rescue:
+
+```bash
+# Compile a RISC-V programme
+docker run --rm -v "$(pwd):/src" dockcross/linux-riscv64 bash -c \
+  "riscv64-unknown-linux-gnu-gcc -static -nostdlib -march=rv64i -mabi=lp64 \
+   -Wl,-Ttext=0x1000,--build-id=none -o /src/output.elf /src/input.S"
+```
+
+Test programmes live in `test/riscv/`. We've verified:
+- `simple.S` - Arithmetic (10+20+30=60)
+- `fib.S` - Fibonacci(10)=55
+
+Both work. We checked twice.
+
 ## Supported Instructions
 
 Currently targeting RV64I base integer instruction set:
@@ -73,6 +90,7 @@ Currently targeting RV64I base integer instruction set:
 - **Branches**: BEQ, BNE, BLT, BGE, BLTU, BGEU
 - **Jumps**: JAL, JALR
 - **Upper Immediate**: LUI, AUIPC
+- **System**: ECALL, EBREAK, FENCE (CSR instructions return 0 because we're a teapot, not a kettle)
 
 ## Register Mapping
 
@@ -92,4 +110,4 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 ---
 
 *"If you wish to make an apple pie from scratch, you must first invent the universe."*
-— Carl Sagan
+- Carl Sagan

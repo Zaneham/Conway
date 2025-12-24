@@ -273,7 +273,9 @@ translate_instruction:
     test ebx, ebx
     jz .emit_li
 
+    push rax                    ; Save immediate (emit_load_rs1 clobbers EAX)
     call emit_load_rs1
+    pop rax                     ; Restore immediate
 
     mov byte [r12], 0x48
     mov byte [r12+1], 0x05
@@ -371,7 +373,9 @@ translate_instruction:
     jmp .emit_li
 
 .xori_general:
+    push rax                    ; Save immediate
     call emit_load_rs1
+    pop rax                     ; Restore immediate
 
     mov byte [r12], 0x48
     mov byte [r12+1], 0x35
@@ -395,7 +399,9 @@ translate_instruction:
     jmp .emit_li
 
 .ori_general:
+    push rax                    ; Save immediate
     call emit_load_rs1
+    pop rax                     ; Restore immediate
 
     mov byte [r12], 0x48
     mov byte [r12+1], 0x0D
@@ -421,7 +427,9 @@ translate_instruction:
     jmp .emit_li
 
 .andi_general:
+    push rax                    ; Save immediate
     call emit_load_rs1
+    pop rax                     ; Restore immediate
 
     mov byte [r12], 0x48
     mov byte [r12+1], 0x25

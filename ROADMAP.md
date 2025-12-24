@@ -59,16 +59,21 @@ Status: **Complete.** The machine can now politely request to exit. Jolly good.
 
 ---
 
-## Phase 5: ELF Loader
+## Phase 5: ELF Loader ✓
 
 Load actual RISC-V binaries instead of hand-coded test cases.
 
-- [ ] **ELF64 parser**: Read RISC-V executables
-- [ ] **Section loading**: Map .text, .data, .rodata, .bss
-- [ ] **Symbol resolution**: For debugging output
-- [ ] **Entry point detection**: Find where to start
+- [x] **ELF64 parser**: Read RISC-V executables (validates magic, class, endianness, machine type)
+- [x] **Section loading**: Map PT_LOAD segments into guest memory
+- [ ] **Symbol resolution**: For debugging output (deferred - not essential)
+- [x] **Entry point detection**: Find where to start
+- [x] **Real binary tests**: Cross-compiled with riscv64-unknown-linux-gnu-gcc via Docker
 
-Status: **Not started.** Will require a stiff drink.
+**Test Programs:**
+- `simple.S`: Arithmetic (10+20+30=60) ✓
+- `fib.S`: Fibonacci(10)=55 ✓
+
+Status: **Complete.** We can now load and execute real cross-compiled RISC-V binaries. The dream is alive!
 
 ---
 
@@ -121,4 +126,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated after Phase 4 completion. The translator now handles system calls, CSRs (sort of), and memory fences. Onwards to ELF loading, where we shall parse headers like a civilised person.*
+*Last updated after Phase 5 completion. We can now load and execute real cross-compiled RISC-V ELF binaries - tested with simple arithmetic and Fibonacci programs compiled via Docker. Also discovered and vanquished a particularly sneaky bug where emit_load_rs1 was clobbering the immediate value in ADDI, XORI, ORI, and ANDI. The tea helped.*
