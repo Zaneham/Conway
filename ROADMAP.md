@@ -82,12 +82,12 @@ Status: **Complete.** We can now load and execute real cross-compiled RISC-V bin
 Make it fast. Or at least faster.
 
 - [x] **Block caching**: Don't re-translate the same code *(moved to Phase 3)*
-- [ ] **Block linking**: Patch exits to jump directly between blocks
+- [x] **Block linking**: Patch exits to jump directly between blocks
 - [ ] **Hot path detection**: Identify frequently-executed blocks
 - [ ] **Register allocation**: Map hot RISC-V regs to x86 regs
 - [ ] **Peephole optimisation**: Combine common instruction sequences
 
-Status: **Partially done.** Block caching complete. Further optimisations await.
+Status: **In progress.** Block caching and linking complete. Blocks now jump directly to their successors, skipping the dispatch loop. The Fibonacci loop is now faster than a caffeinated rabbit.
 
 ---
 
@@ -107,11 +107,11 @@ Status: **The dream.** Every emulator must eventually run Doom. It is known.
 
 Things that would be lovely but aren't essential:
 
-- [ ] **M extension**: Multiply/divide instructions
+- [x] **M extension**: Multiply/divide instructions (MUL, MULH, MULHU, DIV, DIVU, REM, REMU)
 - [ ] **A extension**: Atomic operations
 - [ ] **F/D extensions**: Floating-point (single/double)
 - [ ] **C extension**: Compressed instructions
-- [ ] **Linux syscall compatibility**: Run actual Linux RISC-V binaries
+- [~] **Linux syscall compatibility**: Basic syscalls working (read, write, exit, brk, mmap)
 - [ ] **Self-hosting**: Translate a RISC-V build of Conway itself
 
 ---

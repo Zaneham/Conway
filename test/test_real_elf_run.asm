@@ -143,7 +143,7 @@ main:
     add rsi, 0x1000
     lea rdx, [rv_regs]
     lea rcx, [rv_pc]
-    mov r8d, 100                    ; Enough blocks for the Fibonacci loop
+    mov r8d, 1000                   ; Enough blocks for larger benchmarks
     call execute_blocks
 
     ; === CHECKPOINT 9 ===

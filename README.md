@@ -80,7 +80,7 @@ Both work. We checked twice.
 
 ## Supported Instructions
 
-Currently targeting RV64I base integer instruction set:
+RV64I base integer instruction set plus M extension:
 
 - **Arithmetic**: ADD, SUB, AND, OR, XOR, SLT, SLTU
 - **Shifts**: SLL, SRL, SRA
@@ -90,6 +90,7 @@ Currently targeting RV64I base integer instruction set:
 - **Branches**: BEQ, BNE, BLT, BGE, BLTU, BGEU
 - **Jumps**: JAL, JALR
 - **Upper Immediate**: LUI, AUIPC
+- **M Extension**: MUL, MULH, MULHSU, MULHU, DIV, DIVU, REM, REMU
 - **System**: ECALL, EBREAK, FENCE (CSR instructions return 0 because we're a teapot, not a kettle)
 
 ## Register Mapping

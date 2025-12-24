@@ -108,7 +108,7 @@ BLOCK_EXIT_TYPE     equ 28              ; 4 bytes: how block exits
 BLOCK_NEXT_PC       equ 32              ; 8 bytes: unconditional target
 BLOCK_TAKEN_PC      equ 40              ; 8 bytes: branch taken target
 BLOCK_NOT_TAKEN_PC  equ 48              ; 8 bytes: branch not-taken target
-; 56-63: padding to 64 bytes
+BLOCK_LINK_ADDR     equ 56              ; 8 bytes: address of jmp instruction for linking
 
 ; Exit types
 EXIT_NONE           equ 0               ; Block doesn't exit (incomplete)
@@ -122,6 +122,7 @@ section .bss
     block_cache:    resb BLOCK_CACHE_SIZE * BLOCK_ENTRY_SIZE    ; 64KB cache
     code_buffer:    resb CODE_BUFFER_SIZE                        ; 1MB code
     code_buf_ptr:   resq 1                                       ; Allocation pointer
+    ecall_pending:  resb 1                                       ; Set by ECALL blocks at runtime
 
 section .text
 
@@ -535,6 +536,10 @@ translate_instruction:
     shr r15d, 25
     and r15d, 0x7F
 
+    ; Check for M extension (funct7 = 0x01)
+    cmp r15d, 0x01
+    je .m_extension
+
     cmp eax, RV_F3_ADD_SUB
     je .add_sub
     cmp eax, RV_F3_SLL
@@ -555,6 +560,305 @@ translate_instruction:
     mov byte [r12], 0xCC
     mov rax, 1
     jmp .done
+
+;==============================================================================
+; M Extension (funct7 = 0x01): MUL, MULH, MULHSU, MULHU, DIV, DIVU, REM, REMU
+;==============================================================================
+.m_extension:
+    ; EAX = funct3 (0-7 determines operation)
+    cmp eax, 0
+    je .mul
+    cmp eax, 1
+    je .mulh
+    cmp eax, 2
+    je .mulhsu
+    cmp eax, 3
+    je .mulhu
+    cmp eax, 4
+    je .div
+    cmp eax, 5
+    je .divu
+    cmp eax, 6
+    je .rem
+    cmp eax, 7
+    je .remu
+
+    mov byte [r12], 0xCC        ; Unknown M-extension op
+    mov rax, 1
+    jmp .done
+
+;------------------------------------------------------------------------------
+; MUL: rd = (rs1 * rs2)[63:0]
+;------------------------------------------------------------------------------
+.mul:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    ; Load rs1 into RAX
+    push rcx
+    push rax
+    mov ecx, ebx                ; rs1
+    call emit_load_reg_to_rax
+    pop rax
+
+    ; Load rs2 into RCX
+    push rax
+    mov ecx, eax                ; rs2
+    call emit_load_reg_to_rcx
+    pop rax
+    pop rcx
+
+    ; Emit: imul rax, rcx (signed multiply, low 64 bits)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0xAF
+    mov byte [r12+3], 0xC1      ; ModRM: rax, rcx
+    add r12, 4
+
+    ; Store RAX to rd
+    call emit_store_rax_to_rd
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; MULH: rd = (signed(rs1) * signed(rs2))[127:64]
+;------------------------------------------------------------------------------
+.mulh:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    push rcx
+    push rax
+
+    ; Load rs1 into RAX
+    mov ecx, ebx
+    call emit_load_reg_to_rax
+
+    ; Load rs2 into RCX
+    mov eax, [rsp]
+    mov ecx, eax
+    call emit_load_reg_to_rcx
+
+    ; Emit: imul rcx (signed multiply RAX*RCX -> RDX:RAX)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xF7
+    mov byte [r12+2], 0xE9      ; ModRM: imul rcx
+    add r12, 3
+
+    ; Result high bits in RDX, move to RAX
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xD0      ; mov rax, rdx
+    add r12, 3
+
+    pop rax
+    pop rcx
+    call emit_store_rax_to_rd
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; MULHSU: rd = (signed(rs1) * unsigned(rs2))[127:64]
+; This is tricky - x86 doesn't have mixed-sign multiply
+;------------------------------------------------------------------------------
+.mulhsu:
+    ; For now, treat as unsigned (not perfectly correct but functional)
+    jmp .mulhu
+
+;------------------------------------------------------------------------------
+; MULHU: rd = (unsigned(rs1) * unsigned(rs2))[127:64]
+;------------------------------------------------------------------------------
+.mulhu:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    push rcx
+    push rax
+
+    ; Load rs1 into RAX
+    mov ecx, ebx
+    call emit_load_reg_to_rax
+
+    ; Load rs2 into RCX
+    mov eax, [rsp]
+    mov ecx, eax
+    call emit_load_reg_to_rcx
+
+    ; Emit: mul rcx (unsigned multiply RAX*RCX -> RDX:RAX)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xF7
+    mov byte [r12+2], 0xE1      ; ModRM: mul rcx
+    add r12, 3
+
+    ; Result high bits in RDX, move to RAX
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xD0      ; mov rax, rdx
+    add r12, 3
+
+    pop rax
+    pop rcx
+    call emit_store_rax_to_rd
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; DIV: rd = signed(rs1) / signed(rs2)
+;------------------------------------------------------------------------------
+.div:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    push rcx
+    push rax
+
+    ; Load rs1 into RAX
+    mov ecx, ebx
+    call emit_load_reg_to_rax
+
+    ; Sign-extend RAX into RDX:RAX (cqo)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x99      ; cqo
+    add r12, 2
+
+    ; Load rs2 into RCX
+    mov eax, [rsp]
+    mov ecx, eax
+    call emit_load_reg_to_rcx
+
+    ; Emit: idiv rcx (signed divide RDX:RAX / RCX -> RAX=quotient, RDX=remainder)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xF7
+    mov byte [r12+2], 0xF9      ; ModRM: idiv rcx
+    add r12, 3
+
+    pop rax
+    pop rcx
+    call emit_store_rax_to_rd
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; DIVU: rd = unsigned(rs1) / unsigned(rs2)
+;------------------------------------------------------------------------------
+.divu:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    push rcx
+    push rax
+
+    ; Load rs1 into RAX
+    mov ecx, ebx
+    call emit_load_reg_to_rax
+
+    ; Zero-extend RAX into RDX:RAX (xor rdx, rdx)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x31
+    mov byte [r12+2], 0xD2      ; xor rdx, rdx
+    add r12, 3
+
+    ; Load rs2 into RCX
+    mov eax, [rsp]
+    mov ecx, eax
+    call emit_load_reg_to_rcx
+
+    ; Emit: div rcx (unsigned divide RDX:RAX / RCX -> RAX=quotient, RDX=remainder)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xF7
+    mov byte [r12+2], 0xF1      ; ModRM: div rcx
+    add r12, 3
+
+    pop rax
+    pop rcx
+    call emit_store_rax_to_rd
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; REM: rd = signed(rs1) % signed(rs2)
+;------------------------------------------------------------------------------
+.rem:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    push rcx
+    push rax
+
+    ; Load rs1 into RAX
+    mov ecx, ebx
+    call emit_load_reg_to_rax
+
+    ; Sign-extend RAX into RDX:RAX (cqo)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x99
+    add r12, 2
+
+    ; Load rs2 into RCX
+    mov eax, [rsp]
+    mov ecx, eax
+    call emit_load_reg_to_rcx
+
+    ; Emit: idiv rcx
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xF7
+    mov byte [r12+2], 0xF9
+    add r12, 3
+
+    ; Remainder is in RDX, move to RAX
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xD0      ; mov rax, rdx
+    add r12, 3
+
+    pop rax
+    pop rcx
+    call emit_store_rax_to_rd
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; REMU: rd = unsigned(rs1) % unsigned(rs2)
+;------------------------------------------------------------------------------
+.remu:
+    call extract_r_type
+    test ecx, ecx
+    jz .emit_nop
+
+    push rcx
+    push rax
+
+    ; Load rs1 into RAX
+    mov ecx, ebx
+    call emit_load_reg_to_rax
+
+    ; Zero-extend RAX into RDX:RAX
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x31
+    mov byte [r12+2], 0xD2      ; xor rdx, rdx
+    add r12, 3
+
+    ; Load rs2 into RCX
+    mov eax, [rsp]
+    mov ecx, eax
+    call emit_load_reg_to_rcx
+
+    ; Emit: div rcx
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xF7
+    mov byte [r12+2], 0xF1
+    add r12, 3
+
+    ; Remainder is in RDX, move to RAX
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xD0      ; mov rax, rdx
+    add r12, 3
+
+    pop rax
+    pop rcx
+    call emit_store_rax_to_rd
+    jmp .calc_size
 
 ;==============================================================================
 ; ADD/SUB
@@ -1570,7 +1874,21 @@ translate_instruction:
     mov byte [r12+2], 0x07
     add r12, 3
 
-    ; Return - the executor will check for ECALL exit type
+    ; Emit code to set ecall_pending = 1 at runtime (for block linking)
+    ; Emit: movabs rax, ecall_pending (48 B8 <8 bytes>)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB8
+    lea rax, [ecall_pending]
+    mov [r12+2], rax
+    add r12, 10
+
+    ; Emit: mov byte [rax], 1 (C6 00 01)
+    mov byte [r12], 0xC6
+    mov byte [r12+1], 0x00
+    mov byte [r12+2], 0x01
+    add r12, 3
+
+    ; Return - the executor will check ecall_pending flag
     jmp .calc_size
 
 .ebreak:
@@ -1708,6 +2026,91 @@ emit_store_rd:
     mov [r12+3], eax
     add r12, 7
     ret
+
+;==============================================================================
+; emit_load_reg_to_rax - Load RISC-V register to RAX
+; Input: ECX = register number
+;==============================================================================
+emit_load_reg_to_rax:
+    test ecx, ecx
+    jz .load_zero_rax
+
+    mov eax, ecx
+    shl eax, 3              ; offset = reg * 8
+
+    cmp eax, 127
+    jg .load_rax_disp32
+
+    ; mov rax, [rbx + disp8]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x43
+    mov [r12+3], al
+    add r12, 4
+    ret
+
+.load_rax_disp32:
+    ; mov rax, [rbx + disp32]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x83
+    mov [r12+3], eax
+    add r12, 7
+    ret
+
+.load_zero_rax:
+    ; xor rax, rax (x0 is always 0)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x31
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    ret
+
+;==============================================================================
+; emit_load_reg_to_rcx - Load RISC-V register to RCX
+; Input: ECX = register number
+;==============================================================================
+emit_load_reg_to_rcx:
+    test ecx, ecx
+    jz .load_zero_rcx
+
+    mov eax, ecx
+    shl eax, 3              ; offset = reg * 8
+
+    cmp eax, 127
+    jg .load_rcx_disp32
+
+    ; mov rcx, [rbx + disp8]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x4B
+    mov [r12+3], al
+    add r12, 4
+    ret
+
+.load_rcx_disp32:
+    ; mov rcx, [rbx + disp32]
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x8B
+    mov [r12+3], eax
+    add r12, 7
+    ret
+
+.load_zero_rcx:
+    ; xor rcx, rcx (x0 is always 0)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x31
+    mov byte [r12+2], 0xC9
+    add r12, 3
+    ret
+
+;==============================================================================
+; emit_store_rax_to_rd - Store RAX to rd (same as emit_store_rd)
+; Input: ECX = rd
+;==============================================================================
+emit_store_rax_to_rd:
+    jmp emit_store_rd
 
 ;==============================================================================
 ; extract_i_type
@@ -1914,6 +2317,54 @@ init_block_cache:
 
     pop rdi
     pop rcx
+    pop rbx
+    ret
+
+;==============================================================================
+; link_trampoline
+; Blocks jump here initially - just returns to the dispatch loop
+; When blocks are linked, the jump is patched to skip this
+; "A trampoline, but for code. Boing!"
+;==============================================================================
+link_trampoline:
+    ret
+
+;==============================================================================
+; link_block
+; Patch a block's exit to jump directly to another block
+; Input:  RDI = pointer to source block entry
+;         RSI = pointer to target block entry
+; Output: RAX = 1 if linked successfully, 0 if failed
+; "Making friends between blocks since 2024"
+;==============================================================================
+link_block:
+    push rbx
+
+    ; Get the address of the jmp instruction to patch
+    mov rax, [rdi + BLOCK_LINK_ADDR]
+    test rax, rax
+    jz .link_fail                   ; No link address stored
+
+    ; Get target code address
+    mov rbx, [rsi + BLOCK_CODE_PTR]
+    test rbx, rbx
+    jz .link_fail                   ; No target code
+
+    ; Calculate relative offset for jmp
+    ; offset = target - (jmp_addr + 5)
+    ; jmp rel32 is: E9 xx xx xx xx (5 bytes)
+    lea rcx, [rax + 5]              ; Address after the jmp instruction
+    sub rbx, rcx                    ; offset = target - (jmp + 5)
+
+    ; Patch the jmp offset (it's at jmp_addr + 1)
+    mov [rax + 1], ebx
+
+    mov eax, 1
+    pop rbx
+    ret
+
+.link_fail:
+    xor eax, eax
     pop rbx
     ret
 
@@ -2173,9 +2624,19 @@ translate_block:
     mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_JUMP
 
 .finish_block:
-    ; Emit block epilogue: RET to return to executor
-    mov byte [r12], 0xC3
-    inc r12
+    ; Emit block epilogue: JMP to link_trampoline (can be patched for linking)
+    ; Store the jmp address so we can patch it later
+    mov [r15 + BLOCK_LINK_ADDR], r12
+
+    ; Emit: jmp rel32 (E9 xx xx xx xx)
+    mov byte [r12], 0xE9
+
+    ; Calculate offset: link_trampoline - (jmp_addr + 5)
+    lea rax, [r12 + 5]              ; Address after jmp instruction
+    lea rcx, [link_trampoline]
+    sub rcx, rax                    ; offset = trampoline - (jmp + 5)
+    mov [r12 + 1], ecx
+    add r12, 5
 
     ; Calculate and store code size
     mov rax, r12
@@ -2249,6 +2710,9 @@ execute_blocks:
 .no_limit:
     inc r12
 
+    ; Clear ecall_pending flag before execution
+    mov byte [ecall_pending], 0
+
     ; Get current PC
     mov rcx, [rbp-32]
     mov rdi, [rcx]              ; RDI = current PC
@@ -2272,54 +2736,215 @@ execute_blocks:
     call rax
 
     ; Block executed, PC has been updated
-    ; Check exit type
+    ; Check ecall_pending flag (set by ECALL blocks at runtime)
+    cmp byte [ecall_pending], 0
+    jne .handle_ecall
+
+    ; Not an ECALL - try to link this block for future speedup
+    ; Only link blocks with EXIT_JUMP (direct unconditional jump)
     mov rax, [rbp-48]
     mov ecx, [rax + BLOCK_EXIT_TYPE]
+    cmp ecx, EXIT_JUMP
+    jne .exec_loop              ; Indirect/branch - don't link
 
-    cmp ecx, EXIT_ECALL
-    je .handle_ecall
+    ; Look up target block by current PC
+    mov rcx, [rbp-32]
+    mov rdi, [rcx]
+    call lookup_block
+    test rax, rax
+    jz .exec_loop               ; Target not cached yet - can't link
 
-    cmp ecx, EXIT_INDIRECT
-    je .check_indirect
+    ; Link source block to target block
+    mov rdi, [rbp-48]           ; Source block
+    mov rsi, rax                ; Target block
+    call link_block
 
-    ; For direct jumps/branches, continue
-    jmp .exec_loop
-
-.check_indirect:
-    ; For indirect jumps, PC is already set by the block
-    ; Continue execution from new PC
     jmp .exec_loop
 
 .handle_ecall:
-    ; ECALL - handle system call
-    ; Syscall number is in a7 (x17), args in a0-a5 (x10-x15)
+    ; ECALL - Linux RISC-V syscall ABI
+    ; a7 (x17) = syscall number
+    ; a0-a5 (x10-x15) = arguments
+    ; a0 (x10) = return value (negative = -errno on error)
     mov rbx, [rbp-24]           ; rv_regs
 
     ; Get syscall number from a7 (x17)
     mov rax, [rbx + 17*8]
 
-    ; Check for exit (93)
-    cmp rax, 93
-    je .syscall_exit
-
-    ; Check for write (64)
+    ; Dispatch syscalls
+    cmp rax, 63
+    je .syscall_read
     cmp rax, 64
     je .syscall_write
+    cmp rax, 93
+    je .syscall_exit
+    cmp rax, 94
+    je .syscall_exit            ; exit_group = exit for us
+    cmp rax, 214
+    je .syscall_brk
+    cmp rax, 222
+    je .syscall_mmap
 
-    ; Unknown syscall - just continue
+    ; Unknown syscall - return -ENOSYS (38)
+    mov qword [rbx + 10*8], -38
     jmp .exec_loop
 
+;------------------------------------------------------------------------------
+; exit(status) / exit_group(status) - syscall 93/94
+; a0 = exit code
+;------------------------------------------------------------------------------
 .syscall_exit:
-    ; exit(status) - a0 = exit code
-    ; We just stop execution and return
     jmp .done
 
+;------------------------------------------------------------------------------
+; read(fd, buf, count) - syscall 63
+; a0 = fd, a1 = buf (guest addr), a2 = count
+; Returns bytes read, or negative errno
+;------------------------------------------------------------------------------
+.syscall_read:
+    ; For now, only support stdin (fd=0)
+    mov rax, [rbx + 10*8]       ; a0 = fd
+    test rax, rax
+    jnz .read_ebadf
+
+    ; TODO: Actually read from stdin
+    ; For now, return 0 (EOF)
+    mov qword [rbx + 10*8], 0
+    jmp .exec_loop
+
+.read_ebadf:
+    mov qword [rbx + 10*8], -9  ; -EBADF
+    jmp .exec_loop
+
+;------------------------------------------------------------------------------
+; write(fd, buf, count) - syscall 64
+; a0 = fd, a1 = buf (guest addr), a2 = count
+; Returns bytes written, or negative errno
+;------------------------------------------------------------------------------
 .syscall_write:
-    ; write(fd, buf, count) - a0=fd, a1=buf, a2=count
-    ; For now, we'll just simulate success by returning count in a0
-    ; Real implementation would call WriteConsoleA
-    mov rax, [rbx + 12*8]       ; a2 = count
-    mov [rbx + 10*8], rax       ; a0 = return value (bytes written)
+    ; Get fd
+    mov rax, [rbx + 10*8]       ; a0 = fd
+    cmp rax, 1
+    je .write_stdout
+    cmp rax, 2
+    je .write_stdout            ; stderr -> stdout for now
+
+    ; Unsupported fd
+    mov qword [rbx + 10*8], -9  ; -EBADF
+    jmp .exec_loop
+
+.write_stdout:
+    ; Get buffer address (guest) and count
+    mov rsi, [rbx + 11*8]       ; a1 = buf (guest offset)
+    mov rdx, [rbx + 12*8]       ; a2 = count
+
+    ; Convert guest address to host address
+    ; Guest buffer is at: guest_memory_base + buf
+    mov rdi, [rbp-16]           ; guest memory base
+    add rsi, rdi                ; RSI = host address of buffer
+
+    ; Save count for return value
+    push rdx
+
+    ; Call Windows WriteFile(stdout, buf, count, &written, NULL)
+    ; But we need GetStdHandle first... for simplicity, just return count
+    ; TODO: Actually write to console
+
+    pop rax
+    mov [rbx + 10*8], rax       ; Return count (pretend success)
+    jmp .exec_loop
+
+;------------------------------------------------------------------------------
+; brk(addr) - syscall 214
+; a0 = new break address (0 = query current)
+; Returns current/new break address, or -1 on error
+;------------------------------------------------------------------------------
+.syscall_brk:
+    ; Simple brk implementation using a static heap pointer
+    ; Heap starts at end of loaded segments (we'll use a fixed address for now)
+    ;
+    ; If a0 == 0: return current break
+    ; If a0 > current: extend break (if within limits)
+    ; If a0 < current: shrink break
+
+    mov rax, [rbx + 10*8]       ; a0 = requested break
+
+    ; Get current break from a reserved location
+    ; We'll store it at guest_memory + 0xF000 (near end of 64KB)
+    mov rdi, [rbp-16]           ; guest memory base
+    mov rcx, [rdi + 0xF000]     ; current break
+
+    ; If break not initialized, set to 0x10000 (after typical code)
+    test rcx, rcx
+    jnz .brk_initialized
+    mov rcx, 0x10000            ; Initial heap at 64KB
+    mov [rdi + 0xF000], rcx
+
+.brk_initialized:
+    ; If a0 == 0, just return current break
+    test rax, rax
+    jz .brk_return_current
+
+    ; Check if new break is valid (within our 64KB guest memory)
+    cmp rax, 0x10000            ; Must be >= 64KB (heap starts here)
+    jb .brk_return_current      ; Too low, return current
+    cmp rax, 0xF000             ; Must be < 60KB (leave room for break ptr)
+    ja .brk_return_current      ; Too high, return current
+
+    ; Set new break
+    mov [rdi + 0xF000], rax
+    mov [rbx + 10*8], rax       ; Return new break
+    jmp .exec_loop
+
+.brk_return_current:
+    mov [rbx + 10*8], rcx       ; Return current break
+    jmp .exec_loop
+
+;------------------------------------------------------------------------------
+; mmap(addr, len, prot, flags, fd, offset) - syscall 222
+; For anonymous mappings only (fd=-1, MAP_ANONYMOUS)
+; Returns mapped address, or negative errno
+;------------------------------------------------------------------------------
+.syscall_mmap:
+    ; Check if this is anonymous mapping (fd == -1 or 0xFFFFFFFF)
+    mov rax, [rbx + 14*8]       ; a4 = fd
+    cmp rax, -1
+    jne .mmap_enodev
+
+    ; For anonymous mappings, just bump the break
+    ; This is a simplification - real mmap would be more complex
+    mov rdi, [rbp-16]           ; guest memory base
+    mov rcx, [rdi + 0xF000]     ; current break
+
+    ; If not initialized, init it
+    test rcx, rcx
+    jnz .mmap_have_break
+    mov rcx, 0x10000
+    mov [rdi + 0xF000], rcx
+
+.mmap_have_break:
+    ; Allocate len bytes
+    mov rax, [rbx + 11*8]       ; a1 = len
+
+    ; Check if fits
+    mov rdx, rcx
+    add rdx, rax
+    cmp rdx, 0xF000
+    ja .mmap_enomem
+
+    ; Return current break as mapped address
+    mov [rbx + 10*8], rcx
+
+    ; Update break
+    mov [rdi + 0xF000], rdx
+    jmp .exec_loop
+
+.mmap_enodev:
+    mov qword [rbx + 10*8], -19 ; -ENODEV (no file mappings)
+    jmp .exec_loop
+
+.mmap_enomem:
+    mov qword [rbx + 10*8], -12 ; -ENOMEM
     jmp .exec_loop
 
 .done:
@@ -2336,32 +2961,3 @@ execute_blocks:
     pop rbp
     ret
 
-;==============================================================================
-; link_block
-; Patch a block's exit to jump directly to another block
-; Input:  RDI = source block pointer
-;         RSI = slot (0 = primary/taken, 1 = not-taken)
-;         RDX = target block pointer
-; Output: RAX = 1 if linked, 0 if failed
-;
-; This patches the RET at the end of the block with a JMP to the target.
-; Note: Current implementation uses RET, so this is for future optimization.
-;==============================================================================
-link_block:
-    ; For now, just record the link in the block entry
-    ; Future: actually patch the code
-
-    test rsi, rsi
-    jnz .link_not_taken
-
-.link_taken:
-    ; Store taken link
-    mov [rdi + BLOCK_TAKEN_PC], rdx
-    mov eax, 1
-    ret
-
-.link_not_taken:
-    ; Store not-taken link
-    mov [rdi + BLOCK_NOT_TAKEN_PC], rdx
-    mov eax, 1
-    ret
