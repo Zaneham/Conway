@@ -78,6 +78,28 @@ Test programmes live in `test/riscv/`. We've verified:
 
 Both work. We checked twice.
 
+## Test Suite Results
+
+We have a compliance test suite that we run against Conway. Rather like a driving test, except the examiner is a 64-bit RISC-V processor and failure means segfaulting into the Thames.
+
+| Test | Status | What It Tests |
+|------|--------|---------------|
+| add_test | PASS | ADD/SUB operations |
+| arith_test | PASS | General arithmetic |
+| shift_test | PASS | SLL, SRL, SRA and friends |
+| memory_test | PASS | Loads and stores (the exciting ones) |
+| mext_test | PASS | M extension (MUL/DIV) |
+| cext_test | PASS | Compressed instructions |
+| branch_test | PENDING | Currently having a bit of a lie-down |
+| imm_test | PENDING | Immediate values need a stern talking-to |
+
+The passing tests cover the core RV64IM instruction set. The pending ones are either incomplete features or, more likely, our test harness having opinions about things.
+
+**Not Yet Implemented** (and we're fine with that, thanks for asking):
+- **A Extension** - Atomics. For when you absolutely must lock that mutex.
+- **F Extension** - Single-precision floats. Decimals are just integers with ambition.
+- **D Extension** - Double-precision floats. Twice the precision, twice the regret.
+
 ## Supported Instructions
 
 RV64I base integer instruction set plus M extension:
