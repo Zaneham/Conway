@@ -109,8 +109,8 @@ Things that would be lovely but aren't essential:
 
 - [x] **M extension**: Multiply/divide instructions (MUL, MULH, MULHU, DIV, DIVU, REM, REMU)
 - [ ] **A extension**: Atomic operations
-- [ ] **F/D extensions**: Floating-point (single/double)
-- [ ] **C extension**: Compressed instructions
+- [x] **F/D extensions**: Floating-point (single/double) - basic ops via SSE
+- [x] **C extension**: Compressed instructions
 - [~] **Linux syscall compatibility**: Basic syscalls working (read, write, exit, brk, mmap, ioctl, fstat, close, openat)
 - [ ] **Self-hosting**: Translate a RISC-V build of Conway itself
 
@@ -126,4 +126,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated during Phase 6. Block linking now patches JMP instructions to skip the dispatch loop entirely. M extension (MUL, DIV, REM family) complete. Linux syscall compatibility expanding nicely. Also added OP-IMM-32 support (addiw et al.) after the compiler decided to use compressed instructions without asking first. Cheeky.*
+*Last updated during Phase 6. Block linking now patches JMP instructions to skip the dispatch loop entirely. M extension (MUL, DIV, REM family) complete. F/D extensions (floating-point single/double) added via x86 SSE. Linux syscall compatibility expanding nicely. Also added OP-IMM-32 support (addiw et al.) after the compiler decided to use compressed instructions without asking first. Cheeky.*

@@ -97,8 +97,6 @@ The passing tests cover the core RV64IM instruction set. The pending ones are ei
 
 **Not Yet Implemented** (and we're fine with that, thanks for asking):
 - **A Extension** - Atomics. For when you absolutely must lock that mutex.
-- **F Extension** - Single-precision floats. Decimals are just integers with ambition.
-- **D Extension** - Double-precision floats. Twice the precision, twice the regret.
 
 ## Supported Instructions
 
@@ -115,6 +113,8 @@ RV64I base integer instruction set plus M extension:
 - **M Extension**: MUL, MULH, MULHSU, MULHU, DIV, DIVU, REM, REMU
 - **System**: ECALL, EBREAK, FENCE
 - **CSR**: CSRRW, CSRRS, CSRRC, CSRRWI, CSRRSI, CSRRCI (cycle, time, misa supported)
+- **F Extension**: FLW, FSW, FADD.S, FSUB.S, FMUL.S, FDIV.S, FSQRT.S, FMIN.S, FMAX.S, FEQ.S, FLT.S, FLE.S, FCVT.W.S, FCVT.S.W
+- **D Extension**: FLD, FSD, FADD.D, FSUB.D, FMUL.D, FDIV.D, FSQRT.D, FMIN.D, FMAX.D, FEQ.D, FLT.D, FLE.D, FCVT.W.D, FCVT.D.W
 
 ## Register Mapping
 

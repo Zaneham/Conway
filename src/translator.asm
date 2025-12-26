@@ -7,6 +7,7 @@ default rel
 
 ; External Windows API functions
 extern Sleep
+extern GetTickCount
 extern GetStdHandle
 extern WriteFile
 extern CreateFileA
@@ -47,6 +48,15 @@ RV_OP_JALR      equ 0x67        ; Jump and Link Register
 RV_OP_BRANCH    equ 0x63        ; Conditional branches
 RV_OP_SYSTEM    equ 0x73        ; ECALL, EBREAK, CSR instructions
 RV_OP_MISC_MEM  equ 0x0F        ; FENCE, FENCE.I
+
+; Floating-point opcodes (F/D extensions)
+RV_OP_LOAD_FP   equ 0x07        ; FLW, FLD
+RV_OP_STORE_FP  equ 0x27        ; FSW, FSD
+RV_OP_MADD      equ 0x43        ; FMADD.S/D
+RV_OP_MSUB      equ 0x47        ; FMSUB.S/D
+RV_OP_NMSUB     equ 0x4B        ; FNMSUB.S/D
+RV_OP_NMADD     equ 0x4F        ; FNMADD.S/D
+RV_OP_OP_FP     equ 0x53        ; Floating-point operations
 
 ; Funct3 for OP-IMM
 RV_F3_ADDI      equ 0x0
@@ -113,6 +123,7 @@ section .data
     msg_done_debug  db "DONE", 13, 10, 0
     msg_syscall     db "Syscall: ", 0
     msg_newline     db 13, 10, 0
+    msg_frame       db "F", 0
 
 section .text
     global translate_instruction
@@ -169,6 +180,10 @@ section .bss
     debug_last_pc:  resq 1                                       ; Debug: last PC before crash
     pc_history:     resq 8                                       ; Circular buffer of last 8 PCs
     pc_history_idx: resq 1                                       ; Current index into pc_history
+    frame_count:    resq 1                                       ; DG_DrawFrame counter
+    start_ticks:    resq 1                                       ; Start time for ticks
+    syscall_count:  resq 1                                       ; Syscall counter for debug
+    stdout_written: resq 1                                       ; Bytes written (unused)
 
     ; CSR (Control and Status Register) storage
     alignb 8
@@ -185,6 +200,17 @@ section .bss
     csr_marchid:    resq 1                  ; 0xF12 - Architecture ID
     csr_mimpid:     resq 1                  ; 0xF13 - Implementation ID
     csr_mhartid:    resq 1                  ; 0xF14 - Hart ID (0 for single-core)
+
+    ; Floating-point register storage (f0-f31)
+    ; Using 64-bit slots for D extension support
+    alignb 16                               ; SSE requires 16-byte alignment
+    global fp_registers
+    fp_registers:   resq 32                 ; 32 x 64-bit = 256 bytes
+
+    ; Floating-point Control and Status Register
+    ; Bits 7:5 = frm (rounding mode), bits 4:0 = fflags (exception flags)
+    global fcsr
+    fcsr:           resd 1
 
 section .text
 
@@ -247,6 +273,28 @@ translate_instruction:
 
     cmp eax, RV_OP_MISC_MEM
     je .fence
+
+    ; Floating-point opcodes (F/D extensions)
+    cmp eax, RV_OP_LOAD_FP
+    je .load_fp
+
+    cmp eax, RV_OP_STORE_FP
+    je .store_fp
+
+    cmp eax, RV_OP_OP_FP
+    je .op_fp
+
+    cmp eax, RV_OP_MADD
+    je .fmadd
+
+    cmp eax, RV_OP_MSUB
+    je .fmsub
+
+    cmp eax, RV_OP_NMSUB
+    je .fnmsub
+
+    cmp eax, RV_OP_NMADD
+    je .fnmadd
 
     ; Unknown - emit INT3
     mov byte [r12], 0xCC
@@ -2665,6 +2713,10 @@ translate_instruction:
     mov byte [r12+2], 0x01
     add r12, 3
 
+    ; Emit RET to return from block to executor
+    mov byte [r12], 0xC3
+    add r12, 1
+
     ; Return - the executor will check ecall_pending flag
     jmp .calc_size
 
@@ -2846,6 +2898,809 @@ translate_instruction:
     ; x86 has strong memory ordering, so FENCE is a NOP
     ; Just emit a NOP for clarity
     mov byte [r12], 0x90
+    mov rax, 1
+    jmp .done
+
+;==============================================================================
+; Floating-Point Load (FLW/FLD)
+; Opcode 0x07, width in funct3: 010=FLW, 011=FLD
+;==============================================================================
+.load_fp:
+    mov eax, edi
+    shr eax, 7
+    and eax, 0x1F
+    mov ecx, eax            ; ECX = rd (FP register index)
+
+    mov eax, edi
+    shr eax, 15
+    and eax, 0x1F
+    mov ebx, eax            ; EBX = rs1 (integer register for base address)
+
+    mov eax, edi
+    shr eax, 20
+    movsx eax, ax           ; Sign-extend to 32 bits
+    mov r10d, eax           ; R10D = sign-extended offset
+
+    mov eax, edi
+    shr eax, 12
+    and eax, 0x7
+    cmp eax, 3
+    je .load_fp_double
+
+    ; FLW - Load 32-bit float
+    test ebx, ebx
+    jz .load_fp_single_zero_base
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    cmp ebx, 16
+    jge .load_fp_single_large_rs1
+
+    mov byte [r12+2], 0x43
+    shl ebx, 3
+    mov byte [r12+3], bl
+    add r12, 4
+    jmp .load_fp_single_add_offset
+
+.load_fp_single_large_rs1:
+    mov byte [r12+2], 0x83
+    shl ebx, 3
+    mov dword [r12+3], ebx
+    add r12, 7
+    jmp .load_fp_single_add_offset
+
+.load_fp_single_zero_base:
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB8
+    mov dword [r12+2], r10d
+    mov dword [r12+6], 0
+    add r12, 10
+    jmp .load_fp_single_movss
+
+.load_fp_single_add_offset:
+    test r10d, r10d
+    jz .load_fp_single_movss
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x05
+    mov dword [r12+2], r10d
+    add r12, 6
+
+.load_fp_single_movss:
+    ; movss xmm0, [rax] - F3 0F 10 00
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x10
+    mov byte [r12+3], 0x00
+    add r12, 4
+
+    ; Store to FP reg: movss [r13 + rd*8], xmm0
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x11
+
+    shl ecx, 3
+    cmp ecx, 127
+    jg .load_fp_single_store_large
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], cl
+    add r12, 6
+    jmp .calc_size
+
+.load_fp_single_store_large:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], ecx
+    add r12, 9
+    jmp .calc_size
+
+.load_fp_double:
+    test ebx, ebx
+    jz .load_fp_double_zero_base
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    cmp ebx, 16
+    jge .load_fp_double_large_rs1
+
+    mov byte [r12+2], 0x43
+    shl ebx, 3
+    mov byte [r12+3], bl
+    add r12, 4
+    jmp .load_fp_double_add_offset
+
+.load_fp_double_large_rs1:
+    mov byte [r12+2], 0x83
+    shl ebx, 3
+    mov dword [r12+3], ebx
+    add r12, 7
+    jmp .load_fp_double_add_offset
+
+.load_fp_double_zero_base:
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB8
+    mov dword [r12+2], r10d
+    mov dword [r12+6], 0
+    add r12, 10
+    jmp .load_fp_double_movsd
+
+.load_fp_double_add_offset:
+    test r10d, r10d
+    jz .load_fp_double_movsd
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x05
+    mov dword [r12+2], r10d
+    add r12, 6
+
+.load_fp_double_movsd:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x10
+    mov byte [r12+3], 0x00
+    add r12, 4
+
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x11
+
+    shl ecx, 3
+    cmp ecx, 127
+    jg .load_fp_double_store_large
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], cl
+    add r12, 6
+    jmp .calc_size
+
+.load_fp_double_store_large:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], ecx
+    add r12, 9
+    jmp .calc_size
+
+;==============================================================================
+; Floating-Point Store (FSW/FSD)
+;==============================================================================
+.store_fp:
+    mov eax, edi
+    shr eax, 15
+    and eax, 0x1F
+    mov ebx, eax
+
+    mov eax, edi
+    shr eax, 20
+    and eax, 0x1F
+    mov ecx, eax
+
+    mov eax, edi
+    shr eax, 7
+    and eax, 0x1F
+    mov r10d, eax
+
+    mov eax, edi
+    shr eax, 25
+    shl eax, 5
+    or r10d, eax
+
+    shl r10d, 20
+    sar r10d, 20
+
+    mov eax, edi
+    shr eax, 12
+    and eax, 0x7
+    cmp eax, 3
+    je .store_fp_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x10
+
+    shl ecx, 3
+    cmp ecx, 127
+    jg .store_fp_single_load_large
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], cl
+    add r12, 6
+    jmp .store_fp_single_calc_addr
+
+.store_fp_single_load_large:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], ecx
+    add r12, 9
+
+.store_fp_single_calc_addr:
+    test ebx, ebx
+    jz .store_fp_single_zero_base
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    cmp ebx, 16
+    jge .store_fp_single_large_rs1
+
+    mov byte [r12+2], 0x43
+    shl ebx, 3
+    mov byte [r12+3], bl
+    add r12, 4
+    jmp .store_fp_single_add_offset
+
+.store_fp_single_large_rs1:
+    mov byte [r12+2], 0x83
+    shl ebx, 3
+    mov dword [r12+3], ebx
+    add r12, 7
+    jmp .store_fp_single_add_offset
+
+.store_fp_single_zero_base:
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB8
+    mov dword [r12+2], r10d
+    mov dword [r12+6], 0
+    add r12, 10
+    jmp .store_fp_single_movss
+
+.store_fp_single_add_offset:
+    test r10d, r10d
+    jz .store_fp_single_movss
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x05
+    mov dword [r12+2], r10d
+    add r12, 6
+
+.store_fp_single_movss:
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x11
+    mov byte [r12+3], 0x00
+    add r12, 4
+    jmp .calc_size
+
+.store_fp_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x10
+
+    shl ecx, 3
+    cmp ecx, 127
+    jg .store_fp_double_load_large
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], cl
+    add r12, 6
+    jmp .store_fp_double_calc_addr
+
+.store_fp_double_load_large:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], ecx
+    add r12, 9
+
+.store_fp_double_calc_addr:
+    test ebx, ebx
+    jz .store_fp_double_zero_base
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    cmp ebx, 16
+    jge .store_fp_double_large_rs1
+
+    mov byte [r12+2], 0x43
+    shl ebx, 3
+    mov byte [r12+3], bl
+    add r12, 4
+    jmp .store_fp_double_add_offset
+
+.store_fp_double_large_rs1:
+    mov byte [r12+2], 0x83
+    shl ebx, 3
+    mov dword [r12+3], ebx
+    add r12, 7
+    jmp .store_fp_double_add_offset
+
+.store_fp_double_zero_base:
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB8
+    mov dword [r12+2], r10d
+    mov dword [r12+6], 0
+    add r12, 10
+    jmp .store_fp_double_movsd
+
+.store_fp_double_add_offset:
+    test r10d, r10d
+    jz .store_fp_double_movsd
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x05
+    mov dword [r12+2], r10d
+    add r12, 6
+
+.store_fp_double_movsd:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x11
+    mov byte [r12+3], 0x00
+    add r12, 4
+    jmp .calc_size
+
+;==============================================================================
+; Floating-Point Operations (OP-FP, opcode 0x53)
+;==============================================================================
+.op_fp:
+    mov eax, edi
+    shr eax, 7
+    and eax, 0x1F
+    mov r8d, eax
+
+    mov eax, edi
+    shr eax, 15
+    and eax, 0x1F
+    mov ebx, eax
+
+    mov eax, edi
+    shr eax, 20
+    and eax, 0x1F
+    mov ecx, eax
+
+    mov eax, edi
+    shr eax, 25
+    and eax, 0x3
+    mov r9d, eax
+
+    mov eax, edi
+    shr eax, 27
+
+    cmp eax, 0
+    je .fp_add
+    cmp eax, 1
+    je .fp_sub
+    cmp eax, 2
+    je .fp_mul
+    cmp eax, 3
+    je .fp_div
+    cmp eax, 0x0B
+    je .fp_sqrt
+    cmp eax, 0x05
+    je .fp_minmax
+    cmp eax, 0x14
+    je .fp_compare
+    cmp eax, 0x18
+    je .fp_cvt_to_int
+    cmp eax, 0x1A
+    je .fp_cvt_from_int
+
+    mov byte [r12], 0xCC
+    mov rax, 1
+    jmp .done
+
+.fp_add:
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    test r9d, r9d
+    jnz .fp_add_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x58
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_add_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x58
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_sub:
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    test r9d, r9d
+    jnz .fp_sub_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5C
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_sub_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5C
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_mul:
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    test r9d, r9d
+    jnz .fp_mul_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x59
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_mul_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x59
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_div:
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    test r9d, r9d
+    jnz .fp_div_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5E
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_div_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5E
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_sqrt:
+    call .fp_load_rs1_xmm0
+
+    test r9d, r9d
+    jnz .fp_sqrt_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x51
+    mov byte [r12+3], 0xC0
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_sqrt_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x51
+    mov byte [r12+3], 0xC0
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_minmax:
+    mov eax, edi
+    shr eax, 12
+    and eax, 0x7
+    push rax
+
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    pop rax
+    test eax, eax
+    jnz .fp_max
+
+    test r9d, r9d
+    jnz .fp_min_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5D
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_min_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5D
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_max:
+    test r9d, r9d
+    jnz .fp_max_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5F
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_max_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5F
+    mov byte [r12+3], 0xC1
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_compare:
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    test r9d, r9d
+    jnz .fp_compare_double
+
+    mov byte [r12], 0x0F
+    mov byte [r12+1], 0x2E
+    mov byte [r12+2], 0xC1
+    add r12, 3
+    jmp .fp_compare_setcc
+
+.fp_compare_double:
+    mov byte [r12], 0x66
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x2E
+    mov byte [r12+3], 0xC1
+    add r12, 4
+
+.fp_compare_setcc:
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
+
+    mov byte [r12], 0x0F
+    mov byte [r12+1], 0x93
+    mov byte [r12+2], 0xC0
+    add r12, 3
+
+    mov byte [r12], 0x0F
+    mov byte [r12+1], 0xB6
+    mov byte [r12+2], 0xC0
+    add r12, 3
+
+    jmp .fp_store_rax_to_int_rd
+
+.fp_cvt_to_int:
+    call .fp_load_rs1_xmm0
+
+    test r9d, r9d
+    jnz .fp_cvt_to_int_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x48
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x2C
+    mov byte [r12+4], 0xC0
+    add r12, 5
+    jmp .fp_store_rax_to_int_rd
+
+.fp_cvt_to_int_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x48
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x2C
+    mov byte [r12+4], 0xC0
+    add r12, 5
+    jmp .fp_store_rax_to_int_rd
+
+.fp_cvt_from_int:
+    call .fp_load_int_rs1_rax
+
+    test r9d, r9d
+    jnz .fp_cvt_from_int_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x48
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x2A
+    mov byte [r12+4], 0xC0
+    add r12, 5
+    jmp .fp_store_xmm0_rd
+
+.fp_cvt_from_int_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x48
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x2A
+    mov byte [r12+4], 0xC0
+    add r12, 5
+    jmp .fp_store_xmm0_rd
+
+;------------------------------------------------------------------------------
+; FP Helpers
+;------------------------------------------------------------------------------
+.fp_load_rs1_xmm0:
+    push rbx
+    shl ebx, 3
+
+    test r9d, r9d
+    jnz .fp_load_rs1_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x10
+    jmp .fp_load_rs1_disp
+
+.fp_load_rs1_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x10
+
+.fp_load_rs1_disp:
+    cmp ebx, 127
+    jg .fp_load_rs1_large
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], bl
+    add r12, 6
+    pop rbx
+    ret
+
+.fp_load_rs1_large:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], ebx
+    add r12, 9
+    pop rbx
+    ret
+
+.fp_load_rs2_xmm1:
+    push rcx
+    shl ecx, 3
+
+    test r9d, r9d
+    jnz .fp_load_rs2_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x10
+    jmp .fp_load_rs2_disp
+
+.fp_load_rs2_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x10
+
+.fp_load_rs2_disp:
+    cmp ecx, 127
+    jg .fp_load_rs2_large
+
+    mov byte [r12+4], 0x4D
+    mov byte [r12+5], cl
+    add r12, 6
+    pop rcx
+    ret
+
+.fp_load_rs2_large:
+    mov byte [r12+4], 0x8D
+    mov dword [r12+5], ecx
+    add r12, 9
+    pop rcx
+    ret
+
+.fp_store_xmm0_rd:
+    push r8
+    shl r8d, 3
+
+    test r9d, r9d
+    jnz .fp_store_double
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x11
+    jmp .fp_store_disp
+
+.fp_store_double:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x11
+
+.fp_store_disp:
+    cmp r8d, 127
+    jg .fp_store_large
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], r8b
+    add r12, 6
+    pop r8
+    jmp .calc_size
+
+.fp_store_large:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], r8d
+    add r12, 9
+    pop r8
+    jmp .calc_size
+
+.fp_store_rax_to_int_rd:
+    test r8d, r8d
+    jz .fp_store_int_done
+
+    push r8
+    shl r8d, 3
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+
+    cmp r8d, 127
+    jg .fp_store_int_large
+
+    mov byte [r12+2], 0x43
+    mov byte [r12+3], r8b
+    add r12, 4
+    pop r8
+    jmp .calc_size
+
+.fp_store_int_large:
+    mov byte [r12+2], 0x83
+    mov dword [r12+3], r8d
+    add r12, 7
+    pop r8
+    jmp .calc_size
+
+.fp_store_int_done:
+    jmp .calc_size
+
+.fp_load_int_rs1_rax:
+    push rbx
+    test ebx, ebx
+    jz .fp_load_int_zero
+
+    shl ebx, 3
+
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+
+    cmp ebx, 127
+    jg .fp_load_int_large
+
+    mov byte [r12+2], 0x43
+    mov byte [r12+3], bl
+    add r12, 4
+    pop rbx
+    ret
+
+.fp_load_int_large:
+    mov byte [r12+2], 0x83
+    mov dword [r12+3], ebx
+    add r12, 7
+    pop rbx
+    ret
+
+.fp_load_int_zero:
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
+    pop rbx
+    ret
+
+;==============================================================================
+; Fused Multiply-Add (stubs using mul+add)
+;==============================================================================
+.fmadd:
+.fmsub:
+.fnmsub:
+.fnmadd:
+    ; FMA not fully implemented - emit INT3
+    mov byte [r12], 0xCC
     mov rax, 1
     jmp .done
 
@@ -5718,6 +6573,48 @@ execute_blocks:
     mov [rcx + rdx*8], rax
     inc qword [pc_history_idx]
 
+    ; Debug: print PC for first N blocks (0 to disable)
+    cmp r12, 0
+    ja .no_pc_print
+    mov rax, 0
+    test rax, rax                  ; Always print first 50
+    jnz .no_pc_print
+    ; Print "P:XXXXXX\n"
+    push r12
+    sub rsp, 48
+    mov byte [num_buffer], 'P'
+    mov byte [num_buffer+1], ':'
+    mov rcx, [rbp-32]
+    mov eax, [rcx]                  ; Get low 32 bits of PC
+    ; Print 6 hex digits
+    mov edi, 6
+    lea rsi, [num_buffer+7]
+.pc_hex_loop:
+    mov ecx, eax
+    and ecx, 0xF
+    cmp cl, 10
+    jb .pc_hex_digit
+    add cl, 'A' - 10
+    jmp .pc_hex_store
+.pc_hex_digit:
+    add cl, '0'
+.pc_hex_store:
+    mov [rsi], cl
+    dec rsi
+    shr eax, 4
+    dec edi
+    jnz .pc_hex_loop
+    mov byte [num_buffer+8], 10    ; newline
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 9
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop r12
+.no_pc_print:
+
     ; Check block limit
     mov rax, [rbp-40]
     test rax, rax
@@ -5762,6 +6659,10 @@ execute_blocks:
     jne .handle_ecall
 
     ; Not an ECALL - try to link this block for future speedup
+    ; DISABLED: Block linking has a bug - blocks jump to wrong targets
+    ; TODO: Fix the linking bug (0x5A9B4 links to 0x63FDA instead of 0x63F60)
+    jmp .exec_loop
+
     ; Only link blocks with EXIT_JUMP (direct unconditional jump)
     mov rax, [rbp-48]
     mov ecx, [rax + BLOCK_EXIT_TYPE]
@@ -5791,6 +6692,53 @@ execute_blocks:
 
     ; Get syscall number from a7 (x17)
     mov rax, [rbx + 17*8]
+
+    ; Debug: Print all syscalls (set to 0 to disable)
+    push rax
+    inc qword [syscall_count]
+    ; Print first N syscalls
+    mov rcx, [syscall_count]
+    cmp rcx, 10
+    ja .skip_syscall_print
+    ; Print syscall number as hex digit
+    push rax
+    sub rsp, 48
+    ; Convert syscall to single char: 0-9 = '0'-'9', 10+ = 'A'-...
+    mov rax, [rsp+48]           ; Get syscall number back
+    mov byte [num_buffer], '['
+    ; Print low nibble as hex
+    mov ecx, eax
+    and ecx, 0xF
+    cmp cl, 10
+    jb .sc_digit1
+    add cl, 'A' - 10
+    jmp .sc_store1
+.sc_digit1:
+    add cl, '0'
+.sc_store1:
+    mov [num_buffer+2], cl
+    ; Print second nibble
+    shr eax, 4
+    and eax, 0xF
+    cmp al, 10
+    jb .sc_digit2
+    add al, 'A' - 10
+    jmp .sc_store2
+.sc_digit2:
+    add al, '0'
+.sc_store2:
+    mov [num_buffer+1], al
+    mov byte [num_buffer+3], ']'
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 4
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+.skip_syscall_print:
+    pop rax
 
     ; Dispatch syscalls
     cmp rax, 29
@@ -6016,6 +6964,25 @@ execute_blocks:
 ; Returns bytes written, or negative errno
 ;------------------------------------------------------------------------------
 .syscall_write:
+    ; Debug: print "FD=X" for first few writes
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'F'
+    mov byte [num_buffer+1], 'D'
+    mov byte [num_buffer+2], '='
+    mov rax, [rbx + 10*8]       ; a0 = fd
+    add al, '0'                 ; Convert to digit (assuming 0-9)
+    mov [num_buffer+3], al
+    mov byte [num_buffer+4], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 5
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+
     ; Get fd
     mov rax, [rbx + 10*8]       ; a0 = fd
     cmp rax, 1
@@ -6028,17 +6995,106 @@ execute_blocks:
     jmp .exec_loop
 
 .write_stdout:
+    ; Simple debug marker
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'W'
+    mov byte [num_buffer+1], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 2
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+
     ; Get buffer address (guest) and count
     mov rsi, [rbx + 11*8]       ; a1 = buf (guest offset)
     mov r8, [rbx + 12*8]        ; a2 = count (use r8 for Windows call)
+
+    ; Debug: print buffer address for first 5 writes
+    push rax
+    mov rax, [syscall_count]
+    cmp rax, 5
+    ja .skip_buf_debug
+    ; Print "W:XXXXXXXX C:XXXX\n" (buffer address and count)
+    push rsi
+    push r8
+    sub rsp, 48
+    mov byte [num_buffer], 'W'
+    mov byte [num_buffer+1], ':'
+    ; Print guest buffer address as 8 hex digits (MSB first)
+    mov eax, esi                ; Guest buffer address
+    mov edi, 8
+    lea rcx, [num_buffer+2]
+.wbuf_hex:
+    rol eax, 4                  ; Rotate MSB nibble to LSB
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .wbuf_digit
+    add dl, 'A' - 10
+    jmp .wbuf_store
+.wbuf_digit:
+    add dl, '0'
+.wbuf_store:
+    mov [rcx], dl
+    inc rcx
+    dec edi
+    jnz .wbuf_hex
+    mov byte [num_buffer+10], ' '
+    mov byte [num_buffer+11], 'C'
+    mov byte [num_buffer+12], ':'
+    ; Also print count as 4 hex digits
+    pop r8                      ; Restore count
+    push r8                     ; Save again
+    mov eax, r8d
+    mov edi, 4
+    lea rcx, [num_buffer+13]
+.wcnt_hex:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .wcnt_digit
+    add dl, 'A' - 10
+    jmp .wcnt_store
+.wcnt_digit:
+    add dl, '0'
+.wcnt_store:
+    mov [rcx], dl
+    inc rcx
+    dec edi
+    jnz .wcnt_hex
+    mov byte [num_buffer+17], 10    ; newline
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 18
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop r8                      ; Restore count
+    pop rsi                     ; Restore buffer address
+.skip_buf_debug:
+    pop rax
 
     ; Convert guest address to host address
     mov rdi, [rbp-16]           ; guest memory base
     add rsi, rdi                ; RSI = host address of buffer
 
+    ; Reload r8 (for count)
+    mov r8, [rbx + 12*8]
+
+    ; Debug: skip if count is 0
+    test r8, r8
+    jz .write_zero
+
     ; Save rbx and count across Windows call
     push rbx
     push r8                     ; Save count
+    push rsi                    ; Save buffer address
 
     ; Call Windows WriteFile(stdout_handle, buf, count, &written, NULL)
     ; RCX = handle, RDX = buffer, R8 = count, R9 = &written
@@ -6051,10 +7107,18 @@ execute_blocks:
     call WriteFile
 
     add rsp, 48
-    pop rax                     ; Restore count (return value)
+    pop rsi                     ; Restore buffer address
+    pop rax                     ; Get count
     pop rbx                     ; Restore rbx
 
-    mov [rbx + 10*8], rax       ; Return bytes written
+    ; Return actual bytes written from WriteFile
+    mov rax, [bytes_written]
+    mov [rbx + 10*8], rax
+    jmp .exec_loop
+
+.write_zero:
+    ; Zero-byte write - just return 0
+    mov qword [rbx + 10*8], 0
     jmp .exec_loop
 
 ;------------------------------------------------------------------------------
@@ -6111,9 +7175,53 @@ execute_blocks:
 .syscall_mmap:
     ; Check if this is anonymous mapping (fd == -1 or 0xFFFFFFFF)
     mov rax, [rbx + 14*8]       ; a4 = fd
-    cmp rax, -1
-    jne .mmap_enodev
 
+    ; Debug: print mmap fd
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'M'
+    mov ecx, eax
+    and ecx, 0xFF
+    mov eax, ecx
+    shr eax, 4
+    cmp al, 10
+    jb .mmap_d1
+    add al, 'A' - 10
+    jmp .mmap_d1s
+.mmap_d1:
+    add al, '0'
+.mmap_d1s:
+    mov [num_buffer+1], al
+    and ecx, 0xF
+    cmp cl, 10
+    jb .mmap_d2
+    add cl, 'A' - 10
+    jmp .mmap_d2s
+.mmap_d2:
+    add cl, '0'
+.mmap_d2s:
+    mov [num_buffer+2], cl
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 3
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+
+    cmp rax, -1
+    jne .mmap_check_anon_flags
+    jmp .mmap_do_anon
+
+.mmap_check_anon_flags:
+    ; Check if MAP_ANONYMOUS (0x20) is set in flags (a3)
+    mov rax, [rbx + 13*8]       ; a3 = flags
+    test rax, 0x20              ; MAP_ANONYMOUS
+    jz .mmap_enodev             ; If not anonymous, reject
+    ; Fall through to do anonymous mapping
+
+.mmap_do_anon:
     ; For anonymous mappings, just bump the break
     ; This is a simplification - real mmap would be more complex
     mov rdi, [rbp-16]           ; guest memory base
@@ -6706,8 +7814,42 @@ execute_blocks:
 ; Currently a stub - just returns 0
 ;------------------------------------------------------------------------------
 .syscall_drawframe:
-    ; For now, just count frames
-    ; TODO: Actually display framebuffer to Windows window
+    ; Count frames and update ticks
+    push rbx
+    push r14
+    sub rsp, 48
+
+    ; Increment frame counter
+    inc qword [frame_count]
+
+    ; Debug: print "F" for first 10 frames
+    mov rax, [frame_count]
+    cmp rax, 10
+    ja .df_no_debug
+    mov rcx, [stdout_handle]
+    lea rdx, [msg_frame]
+    mov r8d, 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+.df_no_debug:
+
+    ; Update ticks in guest memory (at offset 0x7F0004)
+    call GetTickCount
+    mov r14, [rbp-16]           ; Guest memory base
+    mov edx, [start_ticks]
+    test edx, edx
+    jnz .df_have_start
+    mov [start_ticks], eax      ; First time - save start
+    xor eax, eax
+.df_have_start:
+    sub eax, [start_ticks]      ; Relative ticks since start
+    mov [r14 + 0x7F0004], eax   ; Store in guest memory
+
+    add rsp, 48
+    pop r14
+    pop rbx
+
     mov qword [rbx + 10*8], 0   ; Return success
     jmp .exec_loop
 
