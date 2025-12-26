@@ -84,13 +84,13 @@ Conway passes the **official RISC-V Architecture Compliance Test Suite** (riscv-
 
 | Extension | Tests | Status |
 |-----------|-------|--------|
-| **I** - Base Integer | 50 | ✅ ALL PASS |
-| **M** - Multiply/Divide | 13 | ✅ ALL PASS |
-| **A** - Atomics | 18 | ✅ ALL PASS |
-| **C** - Compressed | 33 | ✅ ALL PASS |
-| **F** - Single-precision FP | 18 | ✅ ALL PASS |
-| **D** - Double-precision FP | 27 | ✅ ALL PASS |
-| **TOTAL** | **159** | ✅ **100%** |
+| **I** - Base Integer | 50 |  ALL PASS |
+| **M** - Multiply/Divide | 13 |  ALL PASS |
+| **A** - Atomics | 18 |  ALL PASS |
+| **C** - Compressed | 33 |  ALL PASS |
+| **F** - Single-precision FP | 18 |  ALL PASS |
+| **D** - Double-precision FP | 27 |  ALL PASS |
+| **TOTAL** | **159** |  **100%** |
 
 Good golly.
 
