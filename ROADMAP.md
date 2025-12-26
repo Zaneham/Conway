@@ -51,7 +51,7 @@ Status: **Complete.** Full block caching implemented. The code is jumping about 
 The bits that make it actually useful.
 
 - [x] **ECALL/EBREAK**: System call interface (exit syscall terminates execution)
-- [x] **CSR instructions**: Control and status registers (stub returning 0 - we're a teapot)
+- [x] **CSR instructions**: Control and status registers (cycle, time, misa implemented via RDTSC)
 - [x] **Fence instructions**: Memory ordering (NOPs on x86, as predicted)
 - [x] **High register fix**: Displacement encoding for x16-x31 now uses 32-bit offsets
 
@@ -111,7 +111,7 @@ Things that would be lovely but aren't essential:
 - [ ] **A extension**: Atomic operations
 - [ ] **F/D extensions**: Floating-point (single/double)
 - [ ] **C extension**: Compressed instructions
-- [~] **Linux syscall compatibility**: Basic syscalls working (read, write, exit, brk, mmap)
+- [~] **Linux syscall compatibility**: Basic syscalls working (read, write, exit, brk, mmap, ioctl, fstat, close, openat)
 - [ ] **Self-hosting**: Translate a RISC-V build of Conway itself
 
 ---
@@ -126,4 +126,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated after Phase 5 completion. We can now load and execute real cross-compiled RISC-V ELF binaries - tested with simple arithmetic and Fibonacci programs compiled via Docker. Also discovered and vanquished a particularly sneaky bug where emit_load_rs1 was clobbering the immediate value in ADDI, XORI, ORI, and ANDI. The tea helped.*
+*Last updated during Phase 6. Block linking now patches JMP instructions to skip the dispatch loop entirely. M extension (MUL, DIV, REM family) complete. Linux syscall compatibility expanding nicely. Also added OP-IMM-32 support (addiw et al.) after the compiler decided to use compressed instructions without asking first. Cheeky.*

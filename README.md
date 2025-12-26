@@ -113,7 +113,8 @@ RV64I base integer instruction set plus M extension:
 - **Jumps**: JAL, JALR
 - **Upper Immediate**: LUI, AUIPC
 - **M Extension**: MUL, MULH, MULHSU, MULHU, DIV, DIVU, REM, REMU
-- **System**: ECALL, EBREAK, FENCE (CSR instructions return 0 because we're a teapot, not a kettle)
+- **System**: ECALL, EBREAK, FENCE
+- **CSR**: CSRRW, CSRRS, CSRRC, CSRRWI, CSRRSI, CSRRCI (cycle, time, misa supported)
 
 ## Register Mapping
 
