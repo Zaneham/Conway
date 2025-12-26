@@ -108,7 +108,7 @@ Status: **The dream.** Every emulator must eventually run Doom. It is known.
 Things that would be lovely but aren't essential:
 
 - [x] **M extension**: Multiply/divide instructions (MUL, MULH, MULHU, DIV, DIVU, REM, REMU)
-- [ ] **A extension**: Atomic operations
+- [x] **A extension**: Atomic operations (LR/SC, AMO family)
 - [x] **F/D extensions**: Floating-point (single/double) - basic ops via SSE
 - [x] **C extension**: Compressed instructions
 - [~] **Linux syscall compatibility**: Basic syscalls working (read, write, exit, brk, mmap, ioctl, fstat, close, openat)
@@ -126,4 +126,4 @@ Things that would be lovely but aren't essential:
 
 ---
 
-*Last updated during Phase 6. Block linking now patches JMP instructions to skip the dispatch loop entirely. M extension (MUL, DIV, REM family) complete. F/D extensions (floating-point single/double) added via x86 SSE. Linux syscall compatibility expanding nicely. Also added OP-IMM-32 support (addiw et al.) after the compiler decided to use compressed instructions without asking first. Cheeky.*
+*Last updated during Phase 6. Block linking now patches JMP instructions to skip the dispatch loop entirely. M extension (MUL, DIV, REM family) complete. F/D extensions (floating-point single/double) added via x86 SSE. A extension (atomics: LR/SC and all AMO ops) now implemented - mutex enthusiasts rejoice. Linux syscall compatibility expanding nicely. Also added OP-IMM-32 support (addiw et al.) after the compiler decided to use compressed instructions without asking first. Cheeky.*
