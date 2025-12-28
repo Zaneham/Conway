@@ -4,7 +4,7 @@ bits 64
 default rel
 
 extern load_elf
-extern elf_entry_point
+extern get_elf_entry_point
 extern init_block_cache
 extern execute_blocks
 extern code_buffer
@@ -13,6 +13,9 @@ extern VirtualProtect
 extern CreateFileA
 extern ReadFile
 extern CloseHandle
+extern GetCommandLineA
+extern GetStdHandle
+extern WriteFile
 
 PAGE_EXECUTE_READWRITE  equ 0x40
 GENERIC_READ            equ 0x80000000
@@ -31,9 +34,10 @@ section .bss
     alignb 8
     file_handle     resq 1
     bytes_read      resq 1
-    elf_buffer      resb 65536
-    guest_memory    resb 65536
+    elf_buffer      resb 2097152    ; 2MB for ELF files
+    guest_memory    resb 2097152    ; 2MB guest memory
     rv_regs         resq 32
+    rv_fp_regs      resq 32         ; FP register file (f0-f31)
     rv_pc           resq 1
     elf_path        resq 1          ; Pointer to ELF path
 
@@ -50,19 +54,40 @@ main:
     mov rbp, rsp
     sub rsp, 80
 
-    ; Save argc and argv
-    ; Windows x64: rcx = argc, rdx = argv
-    mov [rbp-8], rcx            ; argc
-    mov [rbp-16], rdx           ; argv
+    ; Get command line using Windows API
+    call GetCommandLineA
+    mov rsi, rax
 
-    ; Check argc - need at least 2 (program name + elf path)
-    cmp rcx, 2
-    jl .use_default
-
-    ; Get argv[1] (the ELF path)
-    mov rax, [rbp-16]           ; argv
-    mov rax, [rax+8]            ; argv[1]
-    mov [elf_path], rax
+    ; Skip past executable name to find argument
+.skip_exe:
+    lodsb
+    test al, al
+    jz .use_default             ; No argument found
+    cmp al, ' '
+    jne .skip_exe
+    ; Skip spaces
+.skip_spaces:
+    lodsb
+    cmp al, ' '
+    je .skip_spaces
+    test al, al
+    jz .use_default             ; Only spaces after exe name
+    ; Handle quoted path - skip opening quote
+    cmp al, '"'
+    jne .no_quote
+    mov [elf_path], rsi         ; Path starts after the quote
+    ; Find and null-terminate at closing quote
+.find_close_quote:
+    lodsb
+    test al, al
+    jz .start_execution         ; No closing quote, use as-is
+    cmp al, '"'
+    jne .find_close_quote
+    mov byte [rsi-1], 0         ; Null-terminate at the closing quote
+    jmp .start_execution
+.no_quote:
+    dec rsi                     ; Back up to first non-space
+    mov [elf_path], rsi
     jmp .start_execution
 
 .use_default:
@@ -96,7 +121,7 @@ main:
     ; Read file
     mov rcx, rax                ; file handle
     lea rdx, [elf_buffer]
-    mov r8d, 65536
+    mov r8d, 2097152            ; 2MB max
     lea r9, [bytes_read]
     mov qword [rsp+32], 0
     call ReadFile
@@ -106,32 +131,89 @@ main:
     call CloseHandle
 
     ; Load ELF
-    lea rcx, [elf_buffer]
-    mov rdx, [bytes_read]
-    lea r8, [guest_memory]
+    ; load_elf(elf_data, elf_size, guest_mem, guest_size)
+    lea rdi, [elf_buffer]
+    mov rsi, [bytes_read]
+    lea rdx, [guest_memory]
+    mov rcx, 2097152            ; 2MB guest memory
     call load_elf
-    test rax, rax
-    jz .load_error
+    test eax, eax
+    jnz .load_error
 
-    ; Get entry point
-    call elf_entry_point
-    mov [rv_pc], rax
-
-    ; Clear registers
+    ; Clear integer registers
     lea rdi, [rv_regs]
-    xor rax, rax
-    mov rcx, 32
-    rep stosq
+    xor eax, eax
+    mov ecx, 32
+.clr:
+    mov [rdi], rax
+    add rdi, 8
+    dec ecx
+    jnz .clr
 
-    ; Set up stack pointer (x2 = sp)
-    lea rax, [guest_memory + 65536 - 256]
-    mov [rv_regs + 2*8], rax
+    ; Clear FP registers
+    lea rdi, [rv_fp_regs]
+    mov ecx, 32
+.clr_fp:
+    mov [rdi], rax
+    add rdi, 8
+    dec ecx
+    jnz .clr_fp
 
     ; Execute
-    lea rcx, [rv_regs]
-    lea rdx, [rv_pc]
-    lea r8, [guest_memory]
+    ; execute_blocks(start_pc, guest_mem, rv_regs, rv_pc_ptr, max_blocks, fp_regs)
+    call get_elf_entry_point    ; Get actual entry point from ELF
+    mov edi, eax                ; Start PC at ELF entry point
+    lea rsi, [guest_memory]     ; Guest memory base
+    lea rdx, [rv_regs]
+    lea rcx, [rv_pc]
+    xor r8d, r8d                ; 0 = unlimited blocks
+    lea r9, [rv_fp_regs]        ; FP register file
     call execute_blocks
+
+    ; DEBUG: If we get here, execute_blocks returned unexpectedly
+    ; Print "RET" marker
+    sub rsp, 48
+    mov byte [rsp], 'R'
+    mov byte [rsp+1], 'E'
+    mov byte [rsp+2], 'T'
+    mov byte [rsp+3], ':'
+    ; Print a0 as hex
+    mov eax, [rv_regs + 10*8]
+    mov ecx, eax
+    shr ecx, 4
+    and ecx, 0xF
+    cmp cl, 10
+    jb .ret_d1
+    add cl, 'A' - 10
+    jmp .ret_s1
+.ret_d1:
+    add cl, '0'
+.ret_s1:
+    mov [rsp+4], cl
+    mov ecx, eax
+    and ecx, 0xF
+    cmp cl, 10
+    jb .ret_d2
+    add cl, 'A' - 10
+    jmp .ret_s2
+.ret_d2:
+    add cl, '0'
+.ret_s2:
+    mov [rsp+5], cl
+    mov byte [rsp+6], 10
+
+    sub rsp, 32
+    mov rcx, -11
+    call GetStdHandle
+    mov rcx, rax
+    lea rdx, [rsp+32]
+    mov r8d, 7
+    lea r9, [rsp+24]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 32
+    add rsp, 48
+    ; END DEBUG
 
     ; Get exit code from a0 (x10)
     mov ecx, [rv_regs + 10*8]

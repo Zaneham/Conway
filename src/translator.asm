@@ -1,11 +1,20 @@
 ; translator.asm
 ; Conway translator - library version (no main)
 ; Just the translate_instruction function for linking with test harnesses
+;
+; Build for Windows: nasm -f win64 translator.asm  (or add -DWINDOWS)
+; Build for Linux:   nasm -f elf64 -DLINUX translator.asm
 
 bits 64
 default rel
 
-; External Windows API functions
+; Default to Windows if no platform specified
+%ifndef LINUX
+%define WINDOWS
+%endif
+
+%ifdef WINDOWS
+; External Windows API functions (only for debug output)
 extern Sleep
 extern GetTickCount
 extern GetStdHandle
@@ -15,11 +24,31 @@ extern ReadFile
 extern CloseHandle
 extern SetFilePointer
 extern ExitProcess
+; These are provided by platform_win.asm
+extern stdout_handle
+extern bytes_written
+%else
+; Linux: debug output is disabled, but code still references these
+; Define local stubs that just return (debug blocks are skipped anyway)
+%define GetStdHandle debug_stub
+%define WriteFile debug_stub
+%define ExitProcess debug_stub
+%define GetTickCount debug_stub
+%define Sleep debug_stub
+%define CreateFileA debug_stub
+%define ReadFile debug_stub
+%define CloseHandle debug_stub
+%define SetFilePointer debug_stub
+%endif
 
 ; Windows file I/O constants
 GENERIC_READ            equ 0x80000000
+GENERIC_WRITE           equ 0x40000000
 FILE_SHARE_READ         equ 1
+FILE_SHARE_WRITE        equ 2
 OPEN_EXISTING           equ 3
+CREATE_ALWAYS           equ 2
+OPEN_ALWAYS             equ 4
 FILE_ATTRIBUTE_NORMAL   equ 0x80
 INVALID_HANDLE_VALUE    equ -1
 FILE_BEGIN              equ 0
@@ -142,6 +171,14 @@ section .data
     msg_frame       db "F", 0
 
 section .text
+
+%ifndef WINDOWS
+; Stub for debug functions on non-Windows platforms
+; These are never actually called (debug is disabled), but need to exist
+debug_stub:
+    ret
+%endif
+
     global translate_instruction
     global translate_block
     global lookup_block
@@ -186,13 +223,20 @@ section .bss
     s4_reported:    resb 1                                       ; Debug flag for s4 corruption
     alignb 8
     last_s4_value:  resq 1                                       ; Track s4 changes
+    last_a0_value:  resq 1                                       ; Track a0 changes
+    last_ra_value:  resq 1                                       ; Track ra changes
     block_2425_execcount: resd 1                                 ; Count executions of block 2425
     alignb 8
-    stdout_handle:  resq 1                                       ; Windows stdout handle
-    bytes_written:  resq 1                                       ; Temp for WriteFile
+%ifndef WINDOWS
+    ; On Linux these are local (debug code is stubbed anyway)
+    stdout_handle:  resq 1
+    bytes_written:  resq 1
+%endif
     bytes_read_tmp: resq 1                                       ; Temp for ReadFile
     file_table:     resq MAX_OPEN_FILES                          ; fd -> Windows HANDLE
     path_buffer:    resb 260                                     ; MAX_PATH for filename conversion
+    path_buffer_ptr: resq 1                                      ; Pointer to path_buffer (for reliable access)
+    openat_src_addr: resq 1                                      ; Source pathname host address for openat
     num_buffer:     resb 256                                     ; Temp for number conversion (enlarged for debug)
     global debug_block_count
     debug_block_count: resq 1                                    ; Debug: block counter
@@ -204,6 +248,89 @@ section .bss
     start_ticks:    resq 1                                       ; Start time for ticks
     syscall_count:  resq 1                                       ; Syscall counter for debug
     stdout_written: resq 1                                       ; Bytes written (unused)
+    store_debug_count: resq 1                                    ; Count stores for debug
+    global store_debug_count
+    lbu_count: resq 1                                            ; LBU translation count
+    sb_count: resq 1                                             ; SB translation count
+    sh_count: resq 1                                             ; SH translation count
+    sw_count: resq 1                                             ; SW translation count
+    sd_count: resq 1                                             ; SD translation count
+    c_sw_count: resq 1                                           ; C.SW translation count
+    c_sd_count: resq 1                                           ; C.SD translation count
+    c_swsp_count: resq 1                                         ; C.SWSP translation count
+    c_sdsp_count: resq 1                                         ; C.SDSP translation count
+    sb_exec_count: resq 1                                        ; SB runtime execution count
+    global sb_exec_count
+    sb_debug_addrs: resq 8                                       ; First 8 SB target addresses
+    sb_debug_vals: resb 8                                        ; First 8 SB values
+    sb_debug_r14: resq 8                                         ; r14 values at store time
+    first_sb_r14: resq 1                                         ; r14 from very first SB store
+    first_sb_addr: resq 1                                        ; Address from very first SB store
+    first_sb_val: resb 1                                         ; Value (cl) from very first SB store
+    first_sb_readback: resb 1                                    ; Read back immediately after store
+    first_sb_captured: resb 1                                    ; Flag: 1 if first already captured
+    ; Second capture: store near openat path (0x6FE000-0x6FF000)
+    path_sb_r14: resq 1
+    path_sb_addr: resq 1
+    path_sb_val: resb 1
+    path_sb_captured: resb 1
+    ; Count stores to path region (0x6FE000-0x6FFFFF)
+    path_region_count: resq 1
+    ; First LBU debug capture
+    first_lbu_addr: resq 1
+    first_lbu_val: resb 1
+    first_lbu_captured: resb 1
+    ; LBU from doom1.wad string area (0x3ae00-0x3af00)
+    global doom_lbu_addr
+    global doom_lbu_val
+    global doom_lbu_captured
+    doom_lbu_addr: resq 1
+    doom_lbu_val: resb 1
+    doom_lbu_captured: resb 1
+    ; Array to capture first 8 LBU values and addresses
+    global lbu_debug_count
+    global lbu_debug_addrs
+    global lbu_debug_vals
+    lbu_debug_count: resq 1
+    lbu_debug_addrs: resq 8
+    lbu_debug_vals: resb 8
+    ; SB store of 'C' (0x43) - track when this value is stored
+    global sb_c_addr
+    global sb_c_captured
+    sb_c_addr: resq 1
+    sb_c_captured: resb 1
+    ; Track any store to 0x6FFA4F
+    global sb_target_val
+    global sb_target_captured
+    sb_target_val: resb 1
+    sb_target_captured: resb 1
+    ; SW corruption detection - track when SW stored != readback
+    global sw_corrupt_addr
+    global sw_corrupt_stored
+    global sw_corrupt_readback
+    global sw_corrupt_captured
+    sw_corrupt_addr: resq 1
+    sw_corrupt_stored: resd 1
+    sw_corrupt_readback: resd 1
+    sw_corrupt_captured: resb 1
+    ; SD corruption detection - track when SD stored != readback
+    global sd_corrupt_addr
+    global sd_corrupt_stored
+    global sd_corrupt_readback
+    global sd_corrupt_captured
+    sd_corrupt_addr: resq 1
+    sd_corrupt_stored: resq 1
+    sd_corrupt_readback: resq 1
+    sd_corrupt_captured: resb 1
+    ; C.SW corruption detection - track when C.SW stored != readback
+    global csw_corrupt_addr
+    global csw_corrupt_stored
+    global csw_corrupt_readback
+    global csw_corrupt_captured
+    csw_corrupt_addr: resq 1
+    csw_corrupt_stored: resd 1
+    csw_corrupt_readback: resd 1
+    csw_corrupt_captured: resb 1
 
     ; CSR (Control and Status Register) storage
     alignb 8
@@ -250,6 +377,7 @@ translate_instruction:
     mov r12, rsi                ; r12 = output pointer
     mov r13d, edi               ; r13d = instruction
     mov r14, rsi                ; r14 = buffer start for size calc
+    mov r15, rdx                ; r15 = current PC (for AUIPC)
 
     ; Extract opcode
     mov eax, edi
@@ -320,7 +448,110 @@ translate_instruction:
     cmp eax, RV_OP_AMO
     je .amo
 
-    ; Unknown - emit INT3
+    ; Unknown opcode - print helpful error and emit INT3
+    push rax
+    push r12
+    push r13
+    sub rsp, 48
+
+    ; Format: "ERR: PC=XXXXXXXX inst=XXXXXXXX op=XX\n"
+    mov byte [num_buffer], 'E'
+    mov byte [num_buffer+1], 'R'
+    mov byte [num_buffer+2], 'R'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], ' '
+    mov byte [num_buffer+5], 'P'
+    mov byte [num_buffer+6], 'C'
+    mov byte [num_buffer+7], '='
+
+    ; Print PC (r15) as 8 hex digits at offset 8
+    mov eax, r15d
+    mov ecx, 8
+    lea rsi, [num_buffer+15]
+.unk_pc_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .unk_pc_dig
+    add dl, 'A' - 10
+    jmp .unk_pc_st
+.unk_pc_dig:
+    add dl, '0'
+.unk_pc_st:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .unk_pc_hex
+
+    mov byte [num_buffer+16], ' '
+    mov byte [num_buffer+17], 'i'
+    mov byte [num_buffer+18], 'n'
+    mov byte [num_buffer+19], 's'
+    mov byte [num_buffer+20], 't'
+    mov byte [num_buffer+21], '='
+
+    ; Print instruction (r13d) as 8 hex digits at offset 22
+    mov eax, r13d
+    mov ecx, 8
+    lea rsi, [num_buffer+29]
+.unk_inst_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .unk_inst_dig
+    add dl, 'A' - 10
+    jmp .unk_inst_st
+.unk_inst_dig:
+    add dl, '0'
+.unk_inst_st:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .unk_inst_hex
+
+    mov byte [num_buffer+30], ' '
+    mov byte [num_buffer+31], 'o'
+    mov byte [num_buffer+32], 'p'
+    mov byte [num_buffer+33], '='
+
+    ; Print opcode (low 7 bits) as 2 hex digits at offset 34
+    mov eax, r13d
+    and eax, 0x7F
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .unk_op_d1
+    add dl, 'A' - 10
+    jmp .unk_op_s1
+.unk_op_d1:
+    add dl, '0'
+.unk_op_s1:
+    mov [num_buffer+34], dl
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .unk_op_d2
+    add dl, 'A' - 10
+    jmp .unk_op_s2
+.unk_op_d2:
+    add dl, '0'
+.unk_op_s2:
+    mov [num_buffer+35], dl
+    mov byte [num_buffer+36], 10
+
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 37
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop r13
+    pop r12
+    pop rax
+
     mov byte [r12], 0xCC
     mov rax, 1
     jmp .done
@@ -373,10 +604,14 @@ translate_instruction:
     test ecx, ecx
     jz .emit_nop
 
+    ; AUIPC: rd = PC + (imm20 << 12)
+    ; eax = imm20 << 12 (from extract_u_type)
+    ; r15 = current PC (passed from translate_block)
     ; Generate: movabs rax, imm64 (10 bytes)
     mov byte [r12], 0x48
     mov byte [r12+1], 0xB8
-    cdqe
+    cdqe                        ; Sign-extend imm to 64 bits
+    add rax, r15                ; Add PC to get final value
     mov [r12+2], rax
 
     ; Generate: mov [rbx + rd*8], rax
@@ -1026,7 +1261,7 @@ translate_instruction:
     mov byte [r12+2], 0xC9      ; test rcx, rcx
     add r12, 3
 
-    ; Emit: jnz +9 (skip mov rax,-1 + jmp)
+    ; Emit: jnz .check_overflow (+9 to skip div-by-zero handling)
     mov byte [r12], 0x75        ; jnz rel8
     mov byte [r12+1], 9         ; skip 9 bytes
     add r12, 2
@@ -1038,17 +1273,52 @@ translate_instruction:
     mov dword [r12+3], 0xFFFFFFFF
     add r12, 7
 
-    ; Emit: jmp +3 (skip idiv rcx)
+    ; Emit: jmp .done (+26 to skip overflow check and idiv)
     mov byte [r12], 0xEB        ; jmp rel8
-    mov byte [r12+1], 3         ; skip 3 bytes
+    mov byte [r12+1], 24        ; skip overflow check + idiv
     add r12, 2
 
+    ; .check_overflow:
+    ; RISC-V: -2^63 / -1 returns -2^63 (overflow case, x86 would fault)
+    ; Emit: cmp rcx, -1 (check if divisor is -1)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xF9      ; cmp rcx, imm8
+    mov byte [r12+3], 0xFF      ; -1
+    add r12, 4
+
+    ; Emit: jne .do_idiv (+12 to skip overflow handling)
+    mov byte [r12], 0x75        ; jne rel8
+    mov byte [r12+1], 15        ; skip to idiv
+    add r12, 2
+
+    ; Check if dividend is -2^63 (0x8000000000000000)
+    ; Emit: mov r11, 0x8000000000000000
+    mov byte [r12], 0x49        ; REX.WB
+    mov byte [r12+1], 0xBB      ; mov r11, imm64
+    mov dword [r12+2], 0        ; low 32 bits
+    mov dword [r12+6], 0x80000000  ; high 32 bits
+    add r12, 10
+
+    ; Emit: cmp rax, r11
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD8      ; cmp rax, r11
+    add r12, 3
+
+    ; Emit: je .done (+3 to skip idiv - rax already has -2^63)
+    mov byte [r12], 0x74        ; je rel8
+    mov byte [r12+1], 3         ; skip idiv
+    add r12, 2
+
+    ; .do_idiv:
     ; Emit: idiv rcx (signed divide RDX:RAX / RCX -> RAX=quotient, RDX=remainder)
     mov byte [r12], 0x48
     mov byte [r12+1], 0xF7
     mov byte [r12+2], 0xF9      ; ModRM: idiv rcx
     add r12, 3
 
+    ; .done:
     pop rax
     pop rcx
     call emit_store_rax_to_rd
@@ -1123,6 +1393,7 @@ translate_instruction:
 ;------------------------------------------------------------------------------
 ; REM: rd = signed(rs1) % signed(rs2)
 ; RISC-V: remainder by zero returns dividend (rs1)
+; RISC-V: -2^63 % -1 = 0 (overflow case, x86 would fault)
 ;------------------------------------------------------------------------------
 .rem:
     call extract_r_type
@@ -1146,18 +1417,68 @@ translate_instruction:
     mov ecx, eax
     call emit_load_reg_to_rcx
 
-    ; Check for zero divisor
+    ; Check for zero divisor - return dividend
     ; Emit: test rcx, rcx
     mov byte [r12], 0x48
     mov byte [r12+1], 0x85
     mov byte [r12+2], 0xC9
     add r12, 3
 
-    ; Emit: jz +6 (skip idiv + mov rdx to rax = 3 + 3 bytes)
-    mov byte [r12], 0x74        ; jz rel8
-    mov byte [r12+1], 6         ; skip 6 bytes
+    ; Emit: jnz .check_overflow (+2 to skip the jmp)
+    mov byte [r12], 0x75        ; jnz rel8
+    mov byte [r12+1], 2         ; skip 2 bytes (jmp)
     add r12, 2
 
+    ; Emit: jmp .done (+27 to skip overflow check and idiv)
+    mov byte [r12], 0xEB        ; jmp rel8
+    mov byte [r12+1], 32        ; skip to done (rax has dividend)
+    add r12, 2
+
+    ; .check_overflow:
+    ; RISC-V: -2^63 % -1 = 0 (overflow case)
+    ; Emit: cmp rcx, -1
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xF9
+    mov byte [r12+3], 0xFF      ; -1
+    add r12, 4
+
+    ; Emit: jne .do_idiv (+15 to skip overflow handling)
+    mov byte [r12], 0x75        ; jne rel8
+    mov byte [r12+1], 15        ; skip to idiv
+    add r12, 2
+
+    ; Check if dividend is -2^63
+    ; Emit: mov r11, 0x8000000000000000
+    mov byte [r12], 0x49        ; REX.WB
+    mov byte [r12+1], 0xBB      ; mov r11, imm64
+    mov dword [r12+2], 0
+    mov dword [r12+6], 0x80000000
+    add r12, 10
+
+    ; Emit: cmp rax, r11
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD8
+    add r12, 3
+
+    ; Emit: jne .do_idiv (+5 to skip xor rax,rax + jmp)
+    mov byte [r12], 0x75        ; jne rel8
+    mov byte [r12+1], 5         ; skip to idiv
+    add r12, 2
+
+    ; Emit: xor rax, rax (result is 0 for overflow case)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x31
+    mov byte [r12+2], 0xC0
+    add r12, 3
+
+    ; Emit: jmp .done (+6)
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 6
+    add r12, 2
+
+    ; .do_idiv:
     ; Emit: idiv rcx
     mov byte [r12], 0x48
     mov byte [r12+1], 0xF7
@@ -1170,8 +1491,7 @@ translate_instruction:
     mov byte [r12+2], 0xD0      ; mov rax, rdx
     add r12, 3
 
-    ; If divisor was zero, RAX still has rs1 (dividend) which is correct
-
+    ; .done:
     pop rax
     pop rcx
     call emit_store_rax_to_rd
@@ -1781,18 +2101,22 @@ translate_instruction:
 
 ;------------------------------------------------------------------------------
 ; DIVW - Divide word (signed)
+; RISC-V: division by zero returns -1
+; RISC-V: -2^31 / -1 returns -2^31 (overflow case)
 ;------------------------------------------------------------------------------
 .divw:
     call extract_r_type
+    ; After extract_r_type: ecx=rd, ebx=rs1, eax=rs2
 
     test ecx, ecx
     jz .emit_nop
 
-    push rcx
-    push rdx
+    push rcx                    ; save rd
+    push rax                    ; save rs2 (was incorrectly using rdx!)
     call emit_load_rs1          ; EAX = rs1
-    pop rdx
-    pop rcx
+    pop rax                     ; restore rs2 into eax
+    mov edx, eax                ; move rs2 to edx for later use
+    pop rcx                     ; restore rd
 
     ; Sign-extend EAX to EDX:EAX using CDQ
     mov byte [r12], 0x99        ; CDQ
@@ -1803,11 +2127,56 @@ translate_instruction:
     mov ecx, edx            ; rs2 register number
     call emit_load_reg_to_rcx
 
+    ; Check for zero divisor
+    ; Emit: test ecx, ecx
+    mov byte [r12], 0x85
+    mov byte [r12+1], 0xC9      ; test ecx, ecx
+    add r12, 2
+
+    ; Emit: jnz .check_overflow (+7)
+    mov byte [r12], 0x75        ; jnz rel8
+    mov byte [r12+1], 7         ; skip to overflow check
+    add r12, 2
+
+    ; Emit: mov eax, -1
+    mov byte [r12], 0xB8        ; mov eax, imm32
+    mov dword [r12+1], 0xFFFFFFFF
+    add r12, 5
+
+    ; Emit: jmp .done (+15 to skip overflow check and idiv)
+    mov byte [r12], 0xEB        ; jmp rel8
+    mov byte [r12+1], 15        ; skip to done
+    add r12, 2
+
+    ; .check_overflow: Check for -2^31 / -1
+    ; Emit: cmp ecx, -1
+    mov byte [r12], 0x83
+    mov byte [r12+1], 0xF9      ; cmp ecx, imm8
+    mov byte [r12+2], 0xFF      ; -1
+    add r12, 3
+
+    ; Emit: jne .do_idiv (+7)
+    mov byte [r12], 0x75        ; jne rel8
+    mov byte [r12+1], 7         ; skip 5 (cmp eax,imm32) + 2 (je) = 7 bytes to idiv
+    add r12, 2
+
+    ; Emit: cmp eax, 0x80000000
+    mov byte [r12], 0x3D        ; cmp eax, imm32
+    mov dword [r12+1], 0x80000000
+    add r12, 5
+
+    ; Emit: je .done (+2) - eax already has -2^31
+    mov byte [r12], 0x74        ; je rel8
+    mov byte [r12+1], 2         ; skip idiv
+    add r12, 2
+
+    ; .do_idiv:
     ; IDIV ECX (EAX = EDX:EAX / ECX)
     mov byte [r12], 0xF7
     mov byte [r12+1], 0xF9      ; IDIV ECX
     add r12, 2
 
+    ; .done:
     ; MOVSXD RAX, EAX
     mov byte [r12], 0x48
     mov byte [r12+1], 0x63
@@ -1820,15 +2189,17 @@ translate_instruction:
 
 ;------------------------------------------------------------------------------
 ; DIVUW - Divide word (unsigned)
+; RISC-V: division by zero returns all 1s
 ;------------------------------------------------------------------------------
 .divuw:
     call extract_r_type
+    ; After extract_r_type: ecx=rd, ebx=rs1, eax=rs2
 
     test ecx, ecx
     jz .emit_nop
 
-    push rcx
-    push rdx
+    push rcx                    ; save rd
+    push rax                    ; save rs2 (was incorrectly using rdx!)
     call emit_load_rs1
 
     ; Zero-extend EAX to EDX:EAX
@@ -1836,19 +2207,43 @@ translate_instruction:
     mov byte [r12+1], 0xD2      ; XOR EDX, EDX
     add r12, 2
 
-    pop rdx
-    pop rcx
+    pop rax                     ; restore rs2 into eax
+    mov edx, eax                ; move rs2 to edx for later use
+    pop rcx                     ; restore rd
 
     ; Load rs2 to RCX (use helper for proper disp8/disp32)
     push rcx
     mov ecx, edx            ; rs2 register number
     call emit_load_reg_to_rcx
 
+    ; Check for zero divisor
+    ; Emit: test ecx, ecx
+    mov byte [r12], 0x85
+    mov byte [r12+1], 0xC9
+    add r12, 2
+
+    ; Emit: jnz .do_div (+7)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 7
+    add r12, 2
+
+    ; Emit: mov eax, -1
+    mov byte [r12], 0xB8
+    mov dword [r12+1], 0xFFFFFFFF
+    add r12, 5
+
+    ; Emit: jmp .done (+2)
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 2
+    add r12, 2
+
+    ; .do_div:
     ; DIV ECX
     mov byte [r12], 0xF7
     mov byte [r12+1], 0xF1      ; DIV ECX
     add r12, 2
 
+    ; .done:
     ; MOVSXD RAX, EAX
     mov byte [r12], 0x48
     mov byte [r12+1], 0x63
@@ -1861,29 +2256,83 @@ translate_instruction:
 
 ;------------------------------------------------------------------------------
 ; REMW - Remainder word (signed)
+; RISC-V: remainder by zero returns dividend
+; RISC-V: -2^31 % -1 = 0 (overflow case)
 ;------------------------------------------------------------------------------
 .remw:
     call extract_r_type
+    ; After extract_r_type: ecx=rd, ebx=rs1, eax=rs2
 
     test ecx, ecx
     jz .emit_nop
 
-    push rcx
-    push rdx
+    push rcx                    ; save rd
+    push rax                    ; save rs2 (was incorrectly using rdx!)
     call emit_load_rs1
 
     ; CDQ
     mov byte [r12], 0x99
     add r12, 1
 
-    pop rdx
-    pop rcx
+    pop rax                     ; restore rs2 into eax
+    mov edx, eax                ; move rs2 to edx for later use
+    pop rcx                     ; restore rd
 
     ; Load rs2 to RCX (use helper for proper disp8/disp32)
     push rcx
     mov ecx, edx            ; rs2 register number
     call emit_load_reg_to_rcx
 
+    ; Check for zero divisor - return dividend
+    ; Emit: test ecx, ecx
+    mov byte [r12], 0x85
+    mov byte [r12+1], 0xC9
+    add r12, 2
+
+    ; Emit: jnz .check_overflow (+2)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 2
+    add r12, 2
+
+    ; Emit: jmp .done (+19 - eax has dividend)
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 20
+    add r12, 2
+
+    ; .check_overflow: Check for -2^31 % -1 = 0
+    ; Emit: cmp ecx, -1
+    mov byte [r12], 0x83
+    mov byte [r12+1], 0xF9
+    mov byte [r12+2], 0xFF
+    add r12, 3
+
+    ; Emit: jne .do_idiv (+11)
+    ; Skip: 5 (cmp eax,imm32) + 2 (jne) + 2 (xor) + 2 (jmp) = 11 bytes
+    mov byte [r12], 0x75
+    mov byte [r12+1], 11
+    add r12, 2
+
+    ; Emit: cmp eax, 0x80000000
+    mov byte [r12], 0x3D
+    mov dword [r12+1], 0x80000000
+    add r12, 5
+
+    ; Emit: jne .do_idiv (+4)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 4
+    add r12, 2
+
+    ; Emit: xor eax, eax (result is 0 for overflow case)
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
+
+    ; Emit: jmp .done (+4)
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 4
+    add r12, 2
+
+    ; .do_idiv:
     ; IDIV ECX
     mov byte [r12], 0xF7
     mov byte [r12+1], 0xF9
@@ -1894,6 +2343,7 @@ translate_instruction:
     mov byte [r12+1], 0xD0
     add r12, 2
 
+    ; .done:
     ; MOVSXD RAX, EAX
     mov byte [r12], 0x48
     mov byte [r12+1], 0x63
@@ -1906,15 +2356,17 @@ translate_instruction:
 
 ;------------------------------------------------------------------------------
 ; REMUW - Remainder word (unsigned)
+; RISC-V: remainder by zero returns dividend
 ;------------------------------------------------------------------------------
 .remuw:
     call extract_r_type
+    ; After extract_r_type: ecx=rd, ebx=rs1, eax=rs2
 
     test ecx, ecx
     jz .emit_nop
 
-    push rcx
-    push rdx
+    push rcx                    ; save rd
+    push rax                    ; save rs2 (was incorrectly using rdx!)
     call emit_load_rs1
 
     ; XOR EDX, EDX
@@ -1922,24 +2374,43 @@ translate_instruction:
     mov byte [r12+1], 0xD2
     add r12, 2
 
-    pop rdx
-    pop rcx
+    pop rax                     ; restore rs2 into eax
+    mov edx, eax                ; move rs2 to edx for later use
+    pop rcx                     ; restore rd
 
     ; Load rs2 to RCX (use helper for proper disp8/disp32)
     push rcx
     mov ecx, edx            ; rs2 register number
     call emit_load_reg_to_rcx
 
+    ; Check for zero divisor - return dividend
+    ; Emit: test ecx, ecx
+    mov byte [r12], 0x85
+    mov byte [r12+1], 0xC9
+    add r12, 2
+
+    ; Emit: jnz .do_div (+2)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 2
+    add r12, 2
+
+    ; Emit: jmp .done (+4 - skip div+mov, eax has dividend)
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 4
+    add r12, 2
+
+    ; .do_div:
     ; DIV ECX
     mov byte [r12], 0xF7
     mov byte [r12+1], 0xF1
     add r12, 2
 
-    ; MOV EAX, EDX
+    ; MOV EAX, EDX (remainder is in EDX)
     mov byte [r12], 0x89
     mov byte [r12+1], 0xD0
     add r12, 2
 
+    ; .done:
     ; MOVSXD RAX, EAX
     mov byte [r12], 0x48
     mov byte [r12+1], 0x63
@@ -2038,7 +2509,7 @@ translate_instruction:
     jmp .calc_size
 
 ;==============================================================================
-; LW - Load Word (sign-extended)
+; LW - Load Word (sign-extended) - WITH BOUNDS CHECK
 ;==============================================================================
 .lw:
     call extract_i_type
@@ -2051,23 +2522,50 @@ translate_instruction:
     call emit_load_rs1
     pop rdx
 
+    ; add rax, imm (6 bytes)
     mov byte [r12], 0x48
     mov byte [r12+1], 0x05
     mov [r12+2], edx
     add r12, 6
 
+    ; Bounds check: if rax >= 0x8000000 (128MB), return 0
+    ; Use: mov rcx, 0x7FFFFFC; cmp rax, rcx; jae skip_load
+    ; mov rcx, imm64 (10 bytes): 48 B9 xx xx xx xx xx xx xx xx
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB9
+    mov dword [r12+2], 0x07FFFFFC    ; low 32 bits
+    mov dword [r12+6], 0             ; high 32 bits
+    add r12, 10
+    ; cmp rax, rcx (3 bytes): 48 39 C8
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xC8
+    add r12, 3
+    ; jae +6 (2 bytes): 73 06 - skip to xor if out of bounds
+    mov byte [r12], 0x73
+    mov byte [r12+1], 0x06
+    add r12, 2
+    ; movsxd rax, [r14+rax] (4 bytes): 49 63 04 06
     mov byte [r12], 0x49
     mov byte [r12+1], 0x63
     mov byte [r12+2], 0x04
     mov byte [r12+3], 0x06
     add r12, 4
+    ; jmp +2 (2 bytes): EB 02 - skip xor
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 0x02
+    add r12, 2
+    ; xor eax, eax (2 bytes): 31 C0 - return 0 for OOB
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
 
     pop rcx
     call emit_store_rd
     jmp .calc_size
 
 ;==============================================================================
-; LD - Load Doubleword
+; LD - Load Doubleword - WITH BOUNDS CHECK
 ;==============================================================================
 .ld:
     call extract_i_type
@@ -2080,16 +2578,37 @@ translate_instruction:
     call emit_load_rs1
     pop rdx
 
+    ; add rax, imm (6 bytes)
     mov byte [r12], 0x48
     mov byte [r12+1], 0x05
     mov [r12+2], edx
     add r12, 6
 
+    ; Bounds check: mov rcx, limit; cmp rax, rcx; jae skip
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB9
+    mov dword [r12+2], 0x07FFFFF8    ; 128MB - 8
+    mov dword [r12+6], 0
+    add r12, 10
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xC8           ; cmp rax, rcx
+    add r12, 3
+    mov byte [r12], 0x73             ; jae +6
+    mov byte [r12+1], 0x06
+    add r12, 2
+    ; mov rax, [r14+rax] (4 bytes)
     mov byte [r12], 0x49
     mov byte [r12+1], 0x8B
     mov byte [r12+2], 0x04
     mov byte [r12+3], 0x06
     add r12, 4
+    mov byte [r12], 0xEB             ; jmp +2
+    mov byte [r12+1], 0x02
+    add r12, 2
+    mov byte [r12], 0x31             ; xor eax, eax
+    mov byte [r12+1], 0xC0
+    add r12, 2
 
     pop rcx
     call emit_store_rd
@@ -2099,6 +2618,7 @@ translate_instruction:
 ; LBU - Load Byte Unsigned
 ;==============================================================================
 .lbu:
+    inc qword [lbu_count]
     call extract_i_type
 
     test ecx, ecx
@@ -2114,12 +2634,154 @@ translate_instruction:
     mov [r12+2], edx
     add r12, 6
 
+    ; Before the load, save address to temp register (r10)
+    ; mov r10, rax (49 89 C2) - save address before load clobbers rax
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    ; movzx rax, byte [r14+rax]
     mov byte [r12], 0x49
     mov byte [r12+1], 0x0F
     mov byte [r12+2], 0xB6
     mov byte [r12+3], 0x04
     mov byte [r12+4], 0x06
     add r12, 5
+
+    ; Debug: capture first LBU address and value
+    ; Check if already captured: mov r11, first_lbu_captured
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBB
+    lea rdx, [first_lbu_captured]
+    mov [r12+2], rdx
+    add r12, 10
+    ; cmp byte [r11], 0
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3B
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0
+    lea rdi, [r12+1]      ; save patch location
+    add r12, 2
+    ; Set captured flag: mov byte [r11], 1
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x03
+    mov byte [r12+3], 0x01
+    add r12, 4
+    ; Save address: mov [first_lbu_addr], r10
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBB
+    lea rdx, [first_lbu_addr]
+    mov [r12+2], rdx
+    add r12, 10
+    mov byte [r12], 0x4D
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x13
+    add r12, 3
+    ; Save value: mov [first_lbu_val], al
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBB
+    lea rdx, [first_lbu_val]
+    mov [r12+2], rdx
+    add r12, 10
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x88
+    mov byte [r12+2], 0x03
+    add r12, 3
+    ; Patch jne offset
+    mov rax, r12
+    sub rax, rdi
+    dec rax
+    mov [rdi], al
+
+    ; Debug: capture LBU from doom1.wad area (0x3ae00-0x3af00)
+    ; Check if already captured: mov r11, doom_lbu_captured
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBB
+    lea rdx, [doom_lbu_captured]
+    mov [r12+2], rdx
+    add r12, 10
+    ; cmp byte [r11], 0
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3B
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip_doom (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0
+    lea rdi, [r12+1]      ; save patch location for skip_doom
+    add r12, 2
+
+    ; Check if address (r10) in range 0x3ae00-0x3af00 (doom1.wad string area)
+    ; 49 81 FA 00 AE 03 00 = cmp r10, 0x3ae00
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x81
+    mov byte [r12+2], 0xFA
+    mov dword [r12+3], 0x0003ae00
+    add r12, 7
+    ; jb skip_doom (72 XX)
+    mov byte [r12], 0x72
+    mov byte [r12+1], 0
+    lea r8, [r12+1]       ; save second patch location
+    add r12, 2
+    ; cmp r10, 0x3af00
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x81
+    mov byte [r12+2], 0xFA
+    mov dword [r12+3], 0x0003af00
+    add r12, 7
+    ; jae skip_doom (73 XX)
+    mov byte [r12], 0x73
+    mov byte [r12+1], 0
+    lea r9, [r12+1]       ; save third patch location
+    add r12, 2
+
+    ; Set captured flag: mov byte [r11], 1
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x03
+    mov byte [r12+3], 0x01
+    add r12, 4
+    ; Save address: mov r11, doom_lbu_addr; mov [r11], r10
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBB
+    lea rdx, [doom_lbu_addr]
+    mov [r12+2], rdx
+    add r12, 10
+    mov byte [r12], 0x4D
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x13
+    add r12, 3
+    ; Save value: mov r11, doom_lbu_val; mov [r11], al
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBB
+    lea rdx, [doom_lbu_val]
+    mov [r12+2], rdx
+    add r12, 10
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x88
+    mov byte [r12+2], 0x03
+    add r12, 3
+
+    ; Patch all skip offsets (first jne, second jb, third jae)
+    mov rax, r12
+    sub rax, rdi
+    dec rax
+    mov [rdi], al
+    mov rax, r12
+    sub rax, r8
+    dec rax
+    mov [r8], al
+    mov rax, r12
+    sub rax, r9
+    dec rax
+    mov [r9], al
 
     pop rcx
     call emit_store_rd
@@ -2209,6 +2871,7 @@ translate_instruction:
 ; SB - Store Byte
 ;==============================================================================
 .sb:
+    inc qword [sb_count]
     call extract_s_type
 
     push rcx
@@ -2245,11 +2908,183 @@ translate_instruction:
     add r12, 7
 
 .sb_store:
+    ; Simple debug: capture r14 and address for FIRST store only
+    ; Check if already captured: cmp byte [first_sb_captured], 0 / jne skip
+    ; mov r10, first_sb_captured (49 BA <8 bytes>)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [first_sb_captured]
+    mov [r12+2], rax
+    add r12, 10
+    ; cmp byte [r10], 0 (41 80 3A 00)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3A
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip (75 XX) - patch later
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0   ; placeholder
+    lea r11, [r12+1]      ; save patch location
+    add r12, 2
+
+    ; Set captured flag: mov byte [r10], 1 (41 C6 02 01)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x02
+    mov byte [r12+3], 0x01
+    add r12, 4
+
+    ; Save r14: mov [first_sb_r14], r14
+    ; mov r10, first_sb_r14 (49 BA <8 bytes>)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [first_sb_r14]
+    mov [r12+2], rax
+    add r12, 10
+    ; mov [r10], r14 (4D 89 32)
+    mov byte [r12], 0x4D
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x32
+    add r12, 3
+
+    ; Save address: mov [first_sb_addr], rax
+    ; mov r10, first_sb_addr (49 BA <8 bytes>)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [first_sb_addr]
+    mov [r12+2], rax
+    add r12, 10
+    ; mov [r10], rax (49 89 02)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x02
+    add r12, 3
+
+    ; Save cl value: mov [first_sb_val], cl
+    ; mov r10, first_sb_val (49 BA <8 bytes>)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [first_sb_val]
+    mov [r12+2], rax
+    add r12, 10
+    ; mov [r10], cl (41 88 0A)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x88
+    mov byte [r12+2], 0x0A
+    add r12, 3
+
+    ; Patch jne offset
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+
+    ; .skip:
+    ; Now emit the actual store: mov [r14 + rax], cl (41 88 0C 06)
     mov byte [r12], 0x41
     mov byte [r12+1], 0x88
     mov byte [r12+2], 0x0C
     mov byte [r12+3], 0x06
     add r12, 4
+
+    ; Debug: detect corruption - after store, check if [r14+rax] == cl
+    ; If not equal, capture the mismatch (first occurrence only)
+    ; movzx r11, byte [r14+rax] (45 0F B6 1C 06)
+    mov byte [r12], 0x45
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0xB6
+    mov byte [r12+3], 0x1C
+    mov byte [r12+4], 0x06
+    add r12, 5
+    ; cmp r11b, cl (44 38 D9)
+    mov byte [r12], 0x44
+    mov byte [r12+1], 0x38
+    mov byte [r12+2], 0xD9
+    add r12, 3
+    ; je skip (74 XX) - no corruption, skip
+    mov byte [r12], 0x74
+    mov byte [r12+1], 0
+    lea rdi, [r12+1]          ; save patch location
+    add r12, 2
+    ; Mismatch detected! Check if already captured
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rdx, [sb_target_captured]
+    mov [r12+2], rdx
+    add r12, 10
+    ; cmp byte [r10], 0
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3A
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0
+    lea r8, [r12+1]           ; save second patch location
+    add r12, 2
+    ; Set captured: mov byte [r10], 1
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x02
+    mov byte [r12+3], 0x01
+    add r12, 4
+    ; Save expected value (cl): mov [sb_target_val], cl
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rdx, [sb_target_val]
+    mov [r12+2], rdx
+    add r12, 10
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x88
+    mov byte [r12+2], 0x0A
+    add r12, 3
+    ; Patch both jumps
+    mov rax, r12
+    sub rax, rdi
+    dec rax
+    mov [rdi], al
+    mov rax, r12
+    sub rax, r8
+    dec rax
+    mov [r8], al
+
+    ; Emit immediate readback for FIRST store only
+    ; mov r10, &first_sb_readback (49 BA <8 bytes>)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [first_sb_readback]
+    mov [r12+2], rax
+    add r12, 10
+    ; cmp byte [r10], 0 (41 80 3A 00)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3A
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip_readback (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0
+    lea r11, [r12+1]
+    add r12, 2
+    ; movzx ecx, byte [r14 + rax] (41 0F B6 0C 06)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0xB6
+    mov byte [r12+3], 0x0C
+    mov byte [r12+4], 0x06
+    add r12, 5
+    ; mov [r10], cl (41 88 0A)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x88
+    mov byte [r12+2], 0x0A
+    add r12, 3
+    ; Patch jne offset
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
 
     jmp .calc_size
 
@@ -2257,6 +3092,7 @@ translate_instruction:
 ; SH - Store Halfword
 ;==============================================================================
 .sh:
+    inc qword [sh_count]
     call extract_s_type
 
     push rcx
@@ -2306,6 +3142,7 @@ translate_instruction:
 ; SW - Store Word
 ;==============================================================================
 .sw:
+    inc qword [sw_count]
     call extract_s_type
 
     push rcx
@@ -2342,11 +3179,107 @@ translate_instruction:
     add r12, 7
 
 .sw_store:
+    ; Emit: mov [r14+rax], ecx (41 89 0C 06)
     mov byte [r12], 0x41
     mov byte [r12+1], 0x89
     mov byte [r12+2], 0x0C
     mov byte [r12+3], 0x06
     add r12, 4
+
+    ; === SW Corruption detection ===
+    ; Read back: mov r11d, [r14+rax] (45 8B 1C 06)
+    mov byte [r12], 0x45
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x1C
+    mov byte [r12+3], 0x06
+    add r12, 4
+
+    ; Compare: cmp r11d, ecx (44 39 D9)
+    mov byte [r12], 0x44
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD9
+    add r12, 3
+
+    ; je skip (74 XX) - no corruption, skip capture
+    mov byte [r12], 0x74
+    mov byte [r12+1], 0       ; placeholder for offset
+    lea r11, [r12+1]          ; save patch location
+    add r12, 2
+
+    ; Check if already captured: mov r10, sw_corrupt_captured
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sw_corrupt_captured]
+    mov [r12+2], rax
+    add r12, 10
+    ; cmp byte [r10], 0 (41 80 3A 00)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3A
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip2 (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0       ; placeholder
+    push r11                  ; save first patch
+    lea r11, [r12+1]          ; save second patch location
+    add r12, 2
+
+    ; Set captured: mov byte [r10], 1 (41 C6 02 01)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x02
+    mov byte [r12+3], 0x01
+    add r12, 4
+
+    ; Save address: mov [sw_corrupt_addr], rax
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sw_corrupt_addr]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x02
+    add r12, 3
+
+    ; Save stored value: mov [sw_corrupt_stored], ecx
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sw_corrupt_stored]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x0A
+    add r12, 3
+
+    ; Save readback: mov [sw_corrupt_readback], r11d
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sw_corrupt_readback]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x45
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x1A
+    add r12, 3
+
+    ; Patch second jne
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+    pop r11                   ; restore first patch location
+
+    ; .skip2:
+    ; Patch first je
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+
+    ; .skip:
 
     jmp .calc_size
 
@@ -2354,6 +3287,7 @@ translate_instruction:
 ; SD - Store Doubleword
 ;==============================================================================
 .sd:
+    inc qword [sd_count]
     call extract_s_type
 
     push rcx
@@ -2390,12 +3324,138 @@ translate_instruction:
     add r12, 7
 
 .sd_store:
-    ; Store: mov [r14 + rax], rcx
+    ; Store: mov [r14 + rax], rcx (49 89 0C 06)
     mov byte [r12], 0x49
     mov byte [r12+1], 0x89
     mov byte [r12+2], 0x0C
     mov byte [r12+3], 0x06
     add r12, 4
+
+    ; === SD Corruption detection ===
+    ; Read back: mov r11, [r14+rax] (4D 8B 1C 06)
+    mov byte [r12], 0x4D
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x1C
+    mov byte [r12+3], 0x06
+    add r12, 4
+
+    ; Compare: cmp r11, rcx (4C 39 D9)
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD9
+    add r12, 3
+
+    ; je skip (74 XX) - no corruption, skip capture
+    mov byte [r12], 0x74
+    mov byte [r12+1], 0       ; placeholder for offset
+    lea r11, [r12+1]          ; save patch location
+    add r12, 2
+
+    ; Check if already captured: mov r10, sd_corrupt_captured
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sd_corrupt_captured]
+    mov [r12+2], rax
+    add r12, 10
+    ; cmp byte [r10], 0 (41 80 3A 00)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3A
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip2 (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0       ; placeholder
+    push r11                  ; save first patch
+    lea r11, [r12+1]          ; save second patch location
+    add r12, 2
+
+    ; Set captured: mov byte [r10], 1 (41 C6 02 01)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x02
+    mov byte [r12+3], 0x01
+    add r12, 4
+
+    ; Save address: mov [sd_corrupt_addr], rax
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sd_corrupt_addr]
+    mov [r12+2], rax
+    add r12, 10
+    ; Need to restore RAX from somewhere... RAX has guest addr
+    ; Actually RAX is still the guest address from earlier
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x02          ; mov [r10], rax
+    add r12, 3
+
+    ; Save stored value: mov [sd_corrupt_stored], rcx
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sd_corrupt_stored]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x0A          ; mov [r10], rcx
+    add r12, 3
+
+    ; Reload readback: mov r11, [r14+rax] - rax is still guest addr
+    ; First reload rax from the computation above
+    ; Actually, we need to preserve rax earlier... this is getting complex
+    ; Let's just save the current r11 which was the readback
+    ; Wait, r11 was clobbered as patch location. Let me re-read:
+    ; mov r10, addr; mov r11, [r14+rax] earlier gave readback in r11
+    ; But then we used r11 for patching
+    ; We need to reload or save differently
+    ; Simpler: just re-read after saving other values
+    ; Re-read: need address still in some reg... this is messy
+
+    ; Actually let me simplify: read back again into r11
+    ; First restore the address into rax
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sd_corrupt_addr]
+    mov [r12+2], rax
+    add r12, 10
+    ; mov rax, [r10] (49 8B 02)
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x02
+    add r12, 3
+    ; mov r11, [r14+rax] (4D 8B 1C 06)
+    mov byte [r12], 0x4D
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x1C
+    mov byte [r12+3], 0x06
+    add r12, 4
+    ; Save readback: mov [sd_corrupt_readback], r11
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [sd_corrupt_readback]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x4D
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x1A          ; mov [r10], r11
+    add r12, 3
+
+    ; Patch second jne
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+    pop r11                   ; restore first patch location
+
+    ; .skip2:
+    ; Patch first je
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+
+    ; .skip:
 
     jmp .calc_size
 
@@ -2973,6 +4033,12 @@ translate_instruction:
     add r12, 6
 
 .load_fp_single_movss:
+    ; Add guest memory base: add rax, r14
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+
     ; movss xmm0, [rax] - F3 0F 10 00
     mov byte [r12], 0xF3
     mov byte [r12+1], 0x0F
@@ -3041,12 +4107,20 @@ translate_instruction:
     add r12, 6
 
 .load_fp_double_movsd:
+    ; Add guest memory base: add rax, r14
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+
+    ; movsd xmm0, [rax] - F2 0F 10 00
     mov byte [r12], 0xF2
     mov byte [r12+1], 0x0F
     mov byte [r12+2], 0x10
     mov byte [r12+3], 0x00
     add r12, 4
 
+    ; Store to FP reg: movsd [r13 + rd*8], xmm0
     mov byte [r12], 0xF2
     mov byte [r12+1], 0x41
     mov byte [r12+2], 0x0F
@@ -3159,6 +4233,13 @@ translate_instruction:
     add r12, 6
 
 .store_fp_single_movss:
+    ; Add guest memory base: add rax, r14
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+
+    ; movss [rax], xmm0 - F3 0F 11 00
     mov byte [r12], 0xF3
     mov byte [r12+1], 0x0F
     mov byte [r12+2], 0x11
@@ -3226,6 +4307,13 @@ translate_instruction:
     add r12, 6
 
 .store_fp_double_movsd:
+    ; Add guest memory base: add rax, r14
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+
+    ; movsd [rax], xmm0 - F2 0F 11 00
     mov byte [r12], 0xF2
     mov byte [r12+1], 0x0F
     mov byte [r12+2], 0x11
@@ -3278,6 +4366,16 @@ translate_instruction:
     je .fp_cvt_to_int
     cmp eax, 0x1A
     je .fp_cvt_from_int
+    cmp eax, 0x04
+    je .fp_sgnj
+    cmp eax, 0x08
+    je .fp_cvt_s_d          ; FCVT.S.D (narrow double to single)
+    cmp eax, 0x09
+    je .fp_cvt_d_s          ; FCVT.D.S (widen single to double)
+    cmp eax, 0x1C
+    je .fp_fmv_x            ; FMV.X.W/FMV.X.D (move FP bits to int)
+    cmp eax, 0x1E
+    je .fp_fmv_to_fp        ; FMV.W.X/FMV.D.X (move int bits to FP)
 
     mov byte [r12], 0xCC
     mov rax, 1
@@ -3480,47 +4578,296 @@ translate_instruction:
     jmp .fp_store_rax_to_int_rd
 
 .fp_cvt_to_int:
+    ; rs2 (in ecx) determines integer type:
+    ; 0 = W (32-bit signed), 1 = WU (32-bit unsigned)
+    ; 2 = L (64-bit signed), 3 = LU (64-bit unsigned)
     call .fp_load_rs1_xmm0
 
-    test r9d, r9d
-    jnz .fp_cvt_to_int_double
+    ; Check if 64-bit (rs2 bit 1 set)
+    test ecx, 2
+    jnz .fp_cvt_to_int_64
 
-    mov byte [r12], 0xF3
-    mov byte [r12+1], 0x48
-    mov byte [r12+2], 0x0F
-    mov byte [r12+3], 0x2C
-    mov byte [r12+4], 0xC0
-    add r12, 5
+    ; 32-bit conversion (W or WU)
+    ; cvttss2si/cvttsd2si eax, xmm0
+    test r9d, r9d
+    jnz .fp_cvt_w_double
+    mov byte [r12], 0xF3          ; cvttss2si eax, xmm0
+    jmp .fp_cvt_w_common
+.fp_cvt_w_double:
+    mov byte [r12], 0xF2          ; cvttsd2si eax, xmm0
+.fp_cvt_w_common:
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x2C
+    mov byte [r12+3], 0xC0
+    add r12, 4
+    ; For WU (unsigned), need to zero-extend; for W (signed), sign-extend
+    test ecx, 1
+    jnz .fp_cvt_wu_extend
+    ; W: sign-extend eax to rax: movsxd rax, eax = 48 63 C0
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .fp_store_rax_to_int_rd
+.fp_cvt_wu_extend:
+    ; WU: zero-extend eax to rax: mov eax, eax (implicit zero-extend in 64-bit mode)
+    ; Actually, just use the 32-bit result in eax, already zero-extended
     jmp .fp_store_rax_to_int_rd
 
-.fp_cvt_to_int_double:
-    mov byte [r12], 0xF2
-    mov byte [r12+1], 0x48
+.fp_cvt_to_int_64:
+    ; 64-bit conversion (L or LU)
+    ; cvttss2si/cvttsd2si rax, xmm0 (with REX.W)
+    test r9d, r9d
+    jnz .fp_cvt_l_double
+    mov byte [r12], 0xF3          ; cvttss2si rax, xmm0
+    jmp .fp_cvt_l_common
+.fp_cvt_l_double:
+    mov byte [r12], 0xF2          ; cvttsd2si rax, xmm0
+.fp_cvt_l_common:
+    mov byte [r12+1], 0x48        ; REX.W for 64-bit
     mov byte [r12+2], 0x0F
     mov byte [r12+3], 0x2C
     mov byte [r12+4], 0xC0
     add r12, 5
+    ; For LU (unsigned) with negative float, x86 returns 0x8000000000000000
+    ; which is the RISC-V defined behavior for out-of-range
     jmp .fp_store_rax_to_int_rd
 
 .fp_cvt_from_int:
+    ; rs2 (in ecx) determines source integer type:
+    ; 0 = W (32-bit signed), 1 = WU (32-bit unsigned)
+    ; 2 = L (64-bit signed), 3 = LU (64-bit unsigned)
     call .fp_load_int_rs1_rax
 
-    test r9d, r9d
-    jnz .fp_cvt_from_int_double
+    ; Check if 64-bit source (rs2 bit 1 set)
+    test ecx, 2
+    jnz .fp_cvt_from_int_64
 
-    mov byte [r12], 0xF3
-    mov byte [r12+1], 0x48
+    ; 32-bit source (W or WU)
+    test ecx, 1
+    jnz .fp_cvt_from_wu
+    ; W: sign-extend eax to rax first (already done by load_int_rs1)
+    jmp .fp_cvt_from_32_emit
+.fp_cvt_from_wu:
+    ; WU: zero-extend eax to rax: mov eax, eax
+    mov byte [r12], 0x89
+    mov byte [r12+1], 0xC0        ; mov eax, eax (clears upper 32 bits)
+    add r12, 2
+.fp_cvt_from_32_emit:
+    ; cvtsi2ss/cvtsi2sd xmm0, eax (32-bit)
+    test r9d, r9d
+    jnz .fp_cvt_from_w_double
+    mov byte [r12], 0xF3          ; cvtsi2ss xmm0, eax
+    jmp .fp_cvt_from_w_common
+.fp_cvt_from_w_double:
+    mov byte [r12], 0xF2          ; cvtsi2sd xmm0, eax
+.fp_cvt_from_w_common:
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x2A
+    mov byte [r12+3], 0xC0
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_cvt_from_int_64:
+    ; 64-bit source (L or LU)
+    ; cvtsi2ss/cvtsi2sd xmm0, rax (with REX.W)
+    test r9d, r9d
+    jnz .fp_cvt_from_l_double
+    mov byte [r12], 0xF3          ; cvtsi2ss xmm0, rax
+    jmp .fp_cvt_from_l_common
+.fp_cvt_from_l_double:
+    mov byte [r12], 0xF2          ; cvtsi2sd xmm0, rax
+.fp_cvt_from_l_common:
+    mov byte [r12+1], 0x48        ; REX.W for 64-bit
     mov byte [r12+2], 0x0F
     mov byte [r12+3], 0x2A
     mov byte [r12+4], 0xC0
     add r12, 5
     jmp .fp_store_xmm0_rd
 
-.fp_cvt_from_int_double:
+;------------------------------------------------------------------------------
+; FSGNJ/FSGNJN/FSGNJX - Sign injection
+; funct3 = 0: FSGNJ (copy sign from rs2)
+; funct3 = 1: FSGNJN (copy negated sign from rs2)
+; funct3 = 2: FSGNJX (xor signs)
+;------------------------------------------------------------------------------
+.fp_sgnj:
+    ; Get funct3 from bits 12-14
+    mov eax, edi
+    shr eax, 12
+    and eax, 0x7
+    push rax                    ; Save funct3
+
+    ; Load both operands
+    call .fp_load_rs1_xmm0
+    call .fp_load_rs2_xmm1
+
+    pop rax                     ; Restore funct3
+
+    ; For FSGNJ with rs1==rs2, this is FMV (just store rs1)
+    ; For simplicity, implement proper sign manipulation
+    test eax, eax
+    jz .fp_sgnj_copy
+    cmp eax, 1
+    je .fp_sgnj_neg
+    ; funct3 = 2: FSGNJX (xor)
+    jmp .fp_sgnj_xor
+
+.fp_sgnj_copy:
+    ; FSGNJ: rd = |rs1| with sign of rs2
+    ; For now, just copy if rs1==rs2 (FMV.S/FMV.D pseudo)
+    ; Full impl would extract sign bit
+    jmp .fp_store_xmm0_rd
+
+.fp_sgnj_neg:
+    ; FSGNJN: rd = |rs1| with negated sign of rs2
+    ; Common use: FNEG when rs1==rs2
+    test r9d, r9d
+    jnz .fp_sgnj_neg_double
+
+    ; Single: xorps xmm0, [sign_mask] - flip sign bit
+    ; Emit: mov eax, 0x80000000; movd xmm1, eax; xorps xmm0, xmm1
+    mov byte [r12], 0xB8          ; mov eax, imm32
+    mov dword [r12+1], 0x80000000
+    mov byte [r12+5], 0x66        ; movd xmm1, eax
+    mov byte [r12+6], 0x0F
+    mov byte [r12+7], 0x6E
+    mov byte [r12+8], 0xC8
+    mov byte [r12+9], 0x0F        ; xorps xmm0, xmm1
+    mov byte [r12+10], 0x57
+    mov byte [r12+11], 0xC1
+    add r12, 12
+    jmp .fp_store_xmm0_rd
+
+.fp_sgnj_neg_double:
+    ; Double: flip sign bit (bit 63)
+    ; mov rax, 0x8000000000000000; movq xmm1, rax; xorpd xmm0, xmm1
+    mov byte [r12], 0x48          ; mov rax, imm64
+    mov byte [r12+1], 0xB8
+    mov dword [r12+2], 0
+    mov dword [r12+6], 0x80000000
+    mov byte [r12+10], 0x66       ; movq xmm1, rax
+    mov byte [r12+11], 0x48
+    mov byte [r12+12], 0x0F
+    mov byte [r12+13], 0x6E
+    mov byte [r12+14], 0xC8
+    mov byte [r12+15], 0x66       ; xorpd xmm0, xmm1
+    mov byte [r12+16], 0x0F
+    mov byte [r12+17], 0x57
+    mov byte [r12+18], 0xC1
+    add r12, 19
+    jmp .fp_store_xmm0_rd
+
+.fp_sgnj_xor:
+    ; FSGNJX: xor signs - common for FABS when rs1==rs2
+    ; Just pass through for now (xor same sign = positive)
+    jmp .fp_store_xmm0_rd
+
+;------------------------------------------------------------------------------
+; FCVT.S.D - Convert double to single precision
+;------------------------------------------------------------------------------
+.fp_cvt_s_d:
+    call .fp_load_rs1_xmm0
+
+    ; cvtsd2ss xmm0, xmm0 = F2 0F 5A C0
     mov byte [r12], 0xF2
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5A
+    mov byte [r12+3], 0xC0
+    add r12, 4
+
+    ; Store as single (force r9=0 for single store)
+    push r9
+    xor r9d, r9d
+    call .fp_store_xmm0_rd_internal
+    pop r9
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; FCVT.D.S - Convert single to double precision
+;------------------------------------------------------------------------------
+.fp_cvt_d_s:
+    ; Load as single (force r9=0)
+    push r9
+    xor r9d, r9d
+    call .fp_load_rs1_xmm0
+    pop r9
+
+    ; cvtss2sd xmm0, xmm0 = F3 0F 5A C0
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x5A
+    mov byte [r12+3], 0xC0
+    add r12, 4
+
+    ; Store as double (force r9=1)
+    push r9
+    mov r9d, 1
+    call .fp_store_xmm0_rd_internal
+    pop r9
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; FMV.X.W / FMV.X.D - Move FP bits to integer register
+; funct7 = 0x1C, rs2 = 0
+;------------------------------------------------------------------------------
+.fp_fmv_x:
+    ; Load FP reg into xmm0
+    call .fp_load_rs1_xmm0
+
+    ; Move to integer register
+    test r9d, r9d
+    jnz .fp_fmv_x_double
+
+    ; FMV.X.W: movd eax, xmm0 = 66 0F 7E C0
+    ; Then sign-extend to 64-bit
+    mov byte [r12], 0x66
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x7E
+    mov byte [r12+3], 0xC0
+    add r12, 4
+    ; movsxd rax, eax = 48 63 C0
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .fp_store_rax_to_int_rd
+
+.fp_fmv_x_double:
+    ; FMV.X.D: movq rax, xmm0 = 66 48 0F 7E C0
+    mov byte [r12], 0x66
     mov byte [r12+1], 0x48
     mov byte [r12+2], 0x0F
-    mov byte [r12+3], 0x2A
+    mov byte [r12+3], 0x7E
+    mov byte [r12+4], 0xC0
+    add r12, 5
+    jmp .fp_store_rax_to_int_rd
+
+;------------------------------------------------------------------------------
+; FMV.W.X / FMV.D.X - Move integer bits to FP register
+; funct7 = 0x1E, rs2 = 0
+;------------------------------------------------------------------------------
+.fp_fmv_to_fp:
+    ; Load integer reg into rax
+    call .fp_load_int_rs1_rax
+
+    test r9d, r9d
+    jnz .fp_fmv_to_fp_double
+
+    ; FMV.W.X: movd xmm0, eax = 66 0F 6E C0
+    mov byte [r12], 0x66
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x6E
+    mov byte [r12+3], 0xC0
+    add r12, 4
+    jmp .fp_store_xmm0_rd
+
+.fp_fmv_to_fp_double:
+    ; FMV.D.X: movq xmm0, rax = 66 48 0F 6E C0
+    mov byte [r12], 0x66
+    mov byte [r12+1], 0x48
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x6E
     mov byte [r12+4], 0xC0
     add r12, 5
     jmp .fp_store_xmm0_rd
@@ -3636,6 +4983,43 @@ translate_instruction:
     pop r8
     jmp .calc_size
 
+; Internal version that returns instead of jumping to calc_size
+.fp_store_xmm0_rd_internal:
+    push r8
+    shl r8d, 3
+
+    test r9d, r9d
+    jnz .fp_store_double_int
+
+    mov byte [r12], 0xF3
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x11
+    jmp .fp_store_disp_int
+
+.fp_store_double_int:
+    mov byte [r12], 0xF2
+    mov byte [r12+1], 0x41
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0x11
+
+.fp_store_disp_int:
+    cmp r8d, 127
+    jg .fp_store_large_int
+
+    mov byte [r12+4], 0x45
+    mov byte [r12+5], r8b
+    add r12, 6
+    pop r8
+    ret
+
+.fp_store_large_int:
+    mov byte [r12+4], 0x85
+    mov dword [r12+5], r8d
+    add r12, 9
+    pop r8
+    ret
+
 .fp_store_rax_to_int_rd:
     test r8d, r8d
     jz .fp_store_int_done
@@ -3712,17 +5096,25 @@ translate_instruction:
 
 ;==============================================================================
 ; AMO - Atomic Memory Operations (A extension)
-; extract_r_type returns: ECX=rd, EBX=rs1, EAX=rs2
+; R-type format: rd = bits 11:7, rs1 = bits 19:15, rs2 = bits 24:20
+; funct5 = bits 31:27, width = bits 14:12 (2=W, 3=D)
+;
+; Runtime registers: rbx = rv_regs, r14 = guest_memory_base
+; We use rcx for address, rax for operand/result, rdx as scratch
 ;==============================================================================
 .amo:
+    ; Extract funct5 (operation type)
     mov eax, edi
     shr eax, 27
     and eax, 0x1F
-    mov r10d, eax
+    mov r10d, eax           ; r10 = funct5
+
+    ; Extract width (2=W, 3=D)
     mov eax, edi
     shr eax, 12
     and eax, 7
-    mov r11d, eax
+    mov r11d, eax           ; r11 = width (2 or 3)
+
     cmp r10d, AMO_LR
     je .amo_lr
     cmp r10d, AMO_SC
@@ -3745,37 +5137,57 @@ translate_instruction:
     je .amo_minu
     cmp r10d, AMO_MAXU
     je .amo_maxu
+
+    ; Unknown AMO operation
     mov byte [r12], 0xCC
     mov rax, 1
     jmp .done
 
+;------------------------------------------------------------------------------
+; LR.W/LR.D - Load Reserved
+; rd = [rs1], set reservation (for single-threaded, just load)
+;------------------------------------------------------------------------------
 .amo_lr:
-    call extract_r_type
-    push rcx
-    push r11
+    call extract_r_type     ; ECX=rd, EBX=rs1, EAX=rs2 (unused)
+    push rcx                ; save rd
+    push r11                ; save width
+
+    ; Emit: mov rax, [rbx + rs1*8]  (load address from rs1)
     call emit_load_rs1
+
+    ; Emit: add rax, r14  (convert to host address)
+    ; 4C 01 F0 = add rax, r14
     mov byte [r12], 0x4C
     mov byte [r12+1], 0x01
     mov byte [r12+2], 0xF0
     add r12, 3
-    mov byte [r12], 0x48
-    mov byte [r12+1], 0x89
-    mov byte [r12+2], 0xC1
-    add r12, 3
-    pop r11
-    pop rcx
+
+    pop r11                 ; restore width
+    pop rcx                 ; restore rd
+
     cmp r11d, 3
     je .amo_lr_d
+
+    ; LR.W: mov eax, [rax] then sign-extend
+    ; 8B 00 = mov eax, [rax]
+    mov byte [r12], 0x8B
+    mov byte [r12+1], 0x00
+    add r12, 2
+    ; 48 63 C0 = movsxd rax, eax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x63
-    mov byte [r12+2], 0x01
+    mov byte [r12+2], 0xC0
     add r12, 3
     jmp .amo_lr_store
+
 .amo_lr_d:
+    ; LR.D: mov rax, [rax]
+    ; 48 8B 00 = mov rax, [rax]
     mov byte [r12], 0x48
     mov byte [r12+1], 0x8B
-    mov byte [r12+2], 0x01
+    mov byte [r12+2], 0x00
     add r12, 3
+
 .amo_lr_store:
     test ecx, ecx
     jz .amo_lr_done
@@ -3783,90 +5195,300 @@ translate_instruction:
 .amo_lr_done:
     jmp .calc_size
 
+;------------------------------------------------------------------------------
+; SC.W/SC.D - Store Conditional
+; [rs1] = rs2, rd = 0 (success) - always succeeds in single-threaded
+;------------------------------------------------------------------------------
 .amo_sc:
-    call extract_r_type
-    push rcx
-    push r11
-    push rax
+    call extract_r_type     ; ECX=rd, EBX=rs1, EAX=rs2
+    push rcx                ; save rd
+    push r11                ; save width
+    mov r10d, eax           ; save rs2 reg number
+
+    ; Emit: mov rcx, [rbx + rs1*8]  (load address from rs1)
+    ; Using emit_load_rs1 which loads into rax, then move to rcx
     call emit_load_rs1
+
+    ; Emit: add rax, r14  (convert to host address)
     mov byte [r12], 0x4C
     mov byte [r12+1], 0x01
     mov byte [r12+2], 0xF0
     add r12, 3
+
+    ; Emit: mov rcx, rax  (save host address in rcx)
+    ; 48 89 C1 = mov rcx, rax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x89
     mov byte [r12+2], 0xC1
     add r12, 3
-    pop rbx
-    pop r11
-    call emit_load_rs1
+
+    ; Emit: mov rax, [rbx + rs2*8]  (load value from rs2)
+    mov ebx, r10d           ; rs2 reg number
+    call emit_load_rs1      ; reusing for rs2
+
+    pop r11                 ; restore width
+
     cmp r11d, 3
     je .amo_sc_d
+
+    ; SC.W: mov [rcx], eax
+    ; 89 01 = mov [rcx], eax
     mov byte [r12], 0x89
     mov byte [r12+1], 0x01
     add r12, 2
-    jmp .amo_sc_ok
+    jmp .amo_sc_result
+
 .amo_sc_d:
+    ; SC.D: mov [rcx], rax
+    ; 48 89 01 = mov [rcx], rax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x89
     mov byte [r12+2], 0x01
     add r12, 3
-.amo_sc_ok:
-    pop rcx
+
+.amo_sc_result:
+    pop rcx                 ; restore rd
     test ecx, ecx
     jz .amo_sc_done
+
+    ; rd = 0 (success)
+    ; 31 C0 = xor eax, eax
     mov byte [r12], 0x31
     mov byte [r12+1], 0xC0
     add r12, 2
     call emit_store_rd
+
 .amo_sc_done:
     jmp .calc_size
 
+;------------------------------------------------------------------------------
+; AMOSWAP.W/D - Atomic Swap: rd = [rs1], [rs1] = rs2
+;------------------------------------------------------------------------------
 .amo_swap:
-    call extract_r_type
-    push rcx
-    push r11
-    push rax
+    call extract_r_type     ; ECX=rd, EBX=rs1, EAX=rs2
+    push rcx                ; save rd
+    push r11                ; save width
+    mov r10d, eax           ; save rs2 reg number
+
+    ; Load address from rs1
     call emit_load_rs1
+
+    ; Add guest memory base: add rax, r14
     mov byte [r12], 0x4C
     mov byte [r12+1], 0x01
     mov byte [r12+2], 0xF0
     add r12, 3
+
+    ; Save host address in rcx: mov rcx, rax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x89
     mov byte [r12+2], 0xC1
     add r12, 3
-    pop rbx
-    pop r11
+
+    ; Load rs2 value into rax
+    mov ebx, r10d
     call emit_load_rs1
+
+    pop r11                 ; restore width
+
     cmp r11d, 3
     je .amo_swap_d
+
+    ; AMOSWAP.W: xchg [rcx], eax then sign-extend
+    ; 87 01 = xchg [rcx], eax
     mov byte [r12], 0x87
     mov byte [r12+1], 0x01
     add r12, 2
+    ; Sign-extend: movsxd rax, eax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x63
     mov byte [r12+2], 0xC0
     add r12, 3
-    jmp .amo_swap_st
+    jmp .amo_swap_store
+
 .amo_swap_d:
+    ; AMOSWAP.D: xchg [rcx], rax
+    ; 48 87 01 = xchg [rcx], rax
     mov byte [r12], 0x48
     mov byte [r12+1], 0x87
     mov byte [r12+2], 0x01
     add r12, 3
-.amo_swap_st:
-    pop rcx
+
+.amo_swap_store:
+    pop rcx                 ; restore rd
     test ecx, ecx
     jz .amo_swap_done
     call emit_store_rd
 .amo_swap_done:
     jmp .calc_size
 
+;------------------------------------------------------------------------------
+; AMOADD.W/D - Atomic Add: rd = old [rs1], [rs1] = old + rs2
+; Uses LOCK XADD which atomically adds and returns old value
+;------------------------------------------------------------------------------
 .amo_add:
+    call extract_r_type     ; ECX=rd, EBX=rs1, EAX=rs2
+    push rcx                ; save rd
+    push r11                ; save width
+    mov r10d, eax           ; save rs2 reg number
+
+    ; Load address from rs1
+    call emit_load_rs1
+
+    ; Add guest memory base: add rax, r14
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+
+    ; Save host address in rcx: mov rcx, rax
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    ; Load rs2 value into rax
+    mov ebx, r10d
+    call emit_load_rs1
+
+    pop r11                 ; restore width
+
+    cmp r11d, 3
+    je .amo_add_d
+
+    ; AMOADD.W: lock xadd [rcx], eax then sign-extend
+    ; F0 0F C1 01 = lock xadd [rcx], eax
+    mov byte [r12], 0xF0
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0xC1
+    mov byte [r12+3], 0x01
+    add r12, 4
+    ; Sign-extend: movsxd rax, eax
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_add_store
+
+.amo_add_d:
+    ; AMOADD.D: lock xadd [rcx], rax
+    ; F0 48 0F C1 01 = lock xadd [rcx], rax
+    mov byte [r12], 0xF0
+    mov byte [r12+1], 0x48
+    mov byte [r12+2], 0x0F
+    mov byte [r12+3], 0xC1
+    mov byte [r12+4], 0x01
+    add r12, 5
+
+.amo_add_store:
+    pop rcx                 ; restore rd
+    test ecx, ecx
+    jz .amo_add_done
+    call emit_store_rd
+.amo_add_done:
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; AMOXOR.W/D - Atomic XOR: rd = old [rs1], [rs1] = old XOR rs2
+; Pattern: load old, compute new, store new (single-threaded safe)
+;------------------------------------------------------------------------------
+.amo_xor:
+    call extract_r_type     ; ECX=rd, EBX=rs1, EAX=rs2
+    push rcx                ; save rd
+    push r11                ; save width
+    mov r10d, eax           ; save rs2 reg number
+
+    ; Load address from rs1 -> rcx (host address)
+    call emit_load_rs1
+    mov byte [r12], 0x4C    ; add rax, r14
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+    mov byte [r12], 0x48    ; mov rcx, rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    ; Load rs2 value into rdx
+    mov ebx, r10d
+    call emit_load_rs1
+    mov byte [r12], 0x48    ; mov rdx, rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11                 ; restore width
+
+    cmp r11d, 3
+    je .amo_xor_d
+
+    ; AMOXOR.W: load dword, xor, store dword, sign-extend result
+    ; mov eax, [rcx] = 8B 01
+    mov byte [r12], 0x8B
+    mov byte [r12+1], 0x01
+    add r12, 2
+    ; push rax (save old value)
+    mov byte [r12], 0x50
+    add r12, 1
+    ; xor eax, edx = 31 D0
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    ; mov [rcx], eax = 89 01
+    mov byte [r12], 0x89
+    mov byte [r12+1], 0x01
+    add r12, 2
+    ; pop rax (restore old value)
+    mov byte [r12], 0x58
+    add r12, 1
+    ; movsxd rax, eax = 48 63 C0
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_xor_store
+
+.amo_xor_d:
+    ; AMOXOR.D: load qword, xor, store qword
+    ; mov rax, [rcx] = 48 8B 01
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    ; push rax
+    mov byte [r12], 0x50
+    add r12, 1
+    ; xor rax, rdx = 48 31 D0
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x31
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    ; mov [rcx], rax = 48 89 01
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    ; pop rax
+    mov byte [r12], 0x58
+    add r12, 1
+
+.amo_xor_store:
+    pop rcx                 ; restore rd
+    test ecx, ecx
+    jz .amo_xor_done
+    call emit_store_rd
+.amo_xor_done:
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; AMOAND.W/D - Atomic AND: rd = old [rs1], [rs1] = old AND rs2
+;------------------------------------------------------------------------------
+.amo_and:
     call extract_r_type
     push rcx
     push r11
-    push rax
+    mov r10d, eax
+
     call emit_load_rs1
     mov byte [r12], 0x4C
     mov byte [r12+1], 0x01
@@ -3876,46 +5498,479 @@ translate_instruction:
     mov byte [r12+1], 0x89
     mov byte [r12+2], 0xC1
     add r12, 3
-    pop rbx
-    pop r11
+
+    mov ebx, r10d
     call emit_load_rs1
+    mov byte [r12], 0x48    ; mov rdx, rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11
     cmp r11d, 3
-    je .amo_add_d
-    mov byte [r12], 0xF0
-    mov byte [r12+1], 0x0F
-    mov byte [r12+2], 0xC1
-    mov byte [r12+3], 0x01
-    add r12, 4
-    mov byte [r12], 0x48
+    je .amo_and_d
+
+    ; AMOAND.W
+    mov byte [r12], 0x8B    ; mov eax, [rcx]
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x21    ; and eax, edx
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    mov byte [r12], 0x89    ; mov [rcx], eax
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+    mov byte [r12], 0x48    ; movsxd rax, eax
     mov byte [r12+1], 0x63
     mov byte [r12+2], 0xC0
     add r12, 3
-    jmp .amo_add_st
-.amo_add_d:
-    mov byte [r12], 0xF0
-    mov byte [r12+1], 0x48
-    mov byte [r12+2], 0x0F
-    mov byte [r12+3], 0xC1
-    mov byte [r12+4], 0x01
-    add r12, 5
-.amo_add_st:
+    jmp .amo_and_store
+
+.amo_and_d:
+    mov byte [r12], 0x48    ; mov rax, [rcx]
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x48    ; and rax, rdx
+    mov byte [r12+1], 0x21
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    mov byte [r12], 0x48    ; mov [rcx], rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+
+.amo_and_store:
     pop rcx
     test ecx, ecx
-    jz .amo_add_done
+    jz .amo_and_done
     call emit_store_rd
-.amo_add_done:
+.amo_and_done:
     jmp .calc_size
 
-.amo_xor:
-.amo_and:
+;------------------------------------------------------------------------------
+; AMOOR.W/D - Atomic OR: rd = old [rs1], [rs1] = old OR rs2
+;------------------------------------------------------------------------------
 .amo_or:
+    call extract_r_type
+    push rcx
+    push r11
+    mov r10d, eax
+
+    call emit_load_rs1
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    mov ebx, r10d
+    call emit_load_rs1
+    mov byte [r12], 0x48    ; mov rdx, rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11
+    cmp r11d, 3
+    je .amo_or_d
+
+    ; AMOOR.W
+    mov byte [r12], 0x8B    ; mov eax, [rcx]
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x09    ; or eax, edx
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    mov byte [r12], 0x89    ; mov [rcx], eax
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+    mov byte [r12], 0x48    ; movsxd rax, eax
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_or_store
+
+.amo_or_d:
+    mov byte [r12], 0x48    ; mov rax, [rcx]
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x48    ; or rax, rdx
+    mov byte [r12+1], 0x09
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    mov byte [r12], 0x48    ; mov [rcx], rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+
+.amo_or_store:
+    pop rcx
+    test ecx, ecx
+    jz .amo_or_done
+    call emit_store_rd
+.amo_or_done:
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; AMOMIN.W/D - Atomic MIN (signed): rd = old, [rs1] = min(old, rs2)
+;------------------------------------------------------------------------------
 .amo_min:
+    call extract_r_type
+    push rcx
+    push r11
+    mov r10d, eax
+
+    call emit_load_rs1
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    mov ebx, r10d
+    call emit_load_rs1
+    mov byte [r12], 0x48    ; mov rdx, rax (rdx = rs2)
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11
+    cmp r11d, 3
+    je .amo_min_d
+
+    ; AMOMIN.W: load, compare, store min
+    mov byte [r12], 0x8B    ; mov eax, [rcx]
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x50    ; push rax (save old)
+    add r12, 1
+    mov byte [r12], 0x39    ; cmp eax, edx
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    mov byte [r12], 0x0F    ; cmovg eax, edx (if old > rs2, use rs2)
+    mov byte [r12+1], 0x4F
+    mov byte [r12+2], 0xC2
+    add r12, 3
+    mov byte [r12], 0x89    ; mov [rcx], eax
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+    mov byte [r12], 0x48    ; movsxd rax, eax
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_min_store
+
+.amo_min_d:
+    mov byte [r12], 0x48    ; mov rax, [rcx]
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x48    ; cmp rax, rdx
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    mov byte [r12], 0x48    ; cmovg rax, rdx
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x4F
+    mov byte [r12+3], 0xC2
+    add r12, 4
+    mov byte [r12], 0x48    ; mov [rcx], rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+
+.amo_min_store:
+    pop rcx
+    test ecx, ecx
+    jz .amo_min_done
+    call emit_store_rd
+.amo_min_done:
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; AMOMAX.W/D - Atomic MAX (signed): rd = old, [rs1] = max(old, rs2)
+;------------------------------------------------------------------------------
 .amo_max:
+    call extract_r_type
+    push rcx
+    push r11
+    mov r10d, eax
+
+    call emit_load_rs1
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    mov ebx, r10d
+    call emit_load_rs1
+    mov byte [r12], 0x48    ; mov rdx, rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11
+    cmp r11d, 3
+    je .amo_max_d
+
+    ; AMOMAX.W
+    mov byte [r12], 0x8B    ; mov eax, [rcx]
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x39    ; cmp eax, edx
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    mov byte [r12], 0x0F    ; cmovl eax, edx (if old < rs2, use rs2)
+    mov byte [r12+1], 0x4C
+    mov byte [r12+2], 0xC2
+    add r12, 3
+    mov byte [r12], 0x89    ; mov [rcx], eax
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+    mov byte [r12], 0x48    ; movsxd rax, eax
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_max_store
+
+.amo_max_d:
+    mov byte [r12], 0x48    ; mov rax, [rcx]
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x48    ; cmp rax, rdx
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    mov byte [r12], 0x48    ; cmovl rax, rdx
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x4C
+    mov byte [r12+3], 0xC2
+    add r12, 4
+    mov byte [r12], 0x48    ; mov [rcx], rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+
+.amo_max_store:
+    pop rcx
+    test ecx, ecx
+    jz .amo_max_done
+    call emit_store_rd
+.amo_max_done:
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; AMOMINU.W/D - Atomic MIN (unsigned): rd = old, [rs1] = min(old, rs2)
+;------------------------------------------------------------------------------
 .amo_minu:
+    call extract_r_type
+    push rcx
+    push r11
+    mov r10d, eax
+
+    call emit_load_rs1
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    mov ebx, r10d
+    call emit_load_rs1
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11
+    cmp r11d, 3
+    je .amo_minu_d
+
+    ; AMOMINU.W
+    mov byte [r12], 0x8B    ; mov eax, [rcx]
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x39    ; cmp eax, edx
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    mov byte [r12], 0x0F    ; cmova eax, edx (if old > rs2 unsigned, use rs2)
+    mov byte [r12+1], 0x47
+    mov byte [r12+2], 0xC2
+    add r12, 3
+    mov byte [r12], 0x89    ; mov [rcx], eax
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+    mov byte [r12], 0x48    ; movsxd rax, eax
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_minu_store
+
+.amo_minu_d:
+    mov byte [r12], 0x48    ; mov rax, [rcx]
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x48    ; cmp rax, rdx
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    mov byte [r12], 0x48    ; cmova rax, rdx
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x47
+    mov byte [r12+3], 0xC2
+    add r12, 4
+    mov byte [r12], 0x48    ; mov [rcx], rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+
+.amo_minu_store:
+    pop rcx
+    test ecx, ecx
+    jz .amo_minu_done
+    call emit_store_rd
+.amo_minu_done:
+    jmp .calc_size
+
+;------------------------------------------------------------------------------
+; AMOMAXU.W/D - Atomic MAX (unsigned): rd = old, [rs1] = max(old, rs2)
+;------------------------------------------------------------------------------
 .amo_maxu:
-    mov byte [r12], 0xCC
-    mov rax, 1
-    jmp .done
+    call extract_r_type
+    push rcx
+    push r11
+    mov r10d, eax
+
+    call emit_load_rs1
+    mov byte [r12], 0x4C
+    mov byte [r12+1], 0x01
+    mov byte [r12+2], 0xF0
+    add r12, 3
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC1
+    add r12, 3
+
+    mov ebx, r10d
+    call emit_load_rs1
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0xC2
+    add r12, 3
+
+    pop r11
+    cmp r11d, 3
+    je .amo_maxu_d
+
+    ; AMOMAXU.W
+    mov byte [r12], 0x8B    ; mov eax, [rcx]
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x39    ; cmp eax, edx
+    mov byte [r12+1], 0xD0
+    add r12, 2
+    mov byte [r12], 0x0F    ; cmovb eax, edx (if old < rs2 unsigned, use rs2)
+    mov byte [r12+1], 0x42
+    mov byte [r12+2], 0xC2
+    add r12, 3
+    mov byte [r12], 0x89    ; mov [rcx], eax
+    mov byte [r12+1], 0x01
+    add r12, 2
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+    mov byte [r12], 0x48    ; movsxd rax, eax
+    mov byte [r12+1], 0x63
+    mov byte [r12+2], 0xC0
+    add r12, 3
+    jmp .amo_maxu_store
+
+.amo_maxu_d:
+    mov byte [r12], 0x48    ; mov rax, [rcx]
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x50    ; push rax
+    add r12, 1
+    mov byte [r12], 0x48    ; cmp rax, rdx
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD0
+    add r12, 3
+    mov byte [r12], 0x48    ; cmovb rax, rdx
+    mov byte [r12+1], 0x0F
+    mov byte [r12+2], 0x42
+    mov byte [r12+3], 0xC2
+    add r12, 4
+    mov byte [r12], 0x48    ; mov [rcx], rax
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x01
+    add r12, 3
+    mov byte [r12], 0x58    ; pop rax
+    add r12, 1
+
+.amo_maxu_store:
+    pop rcx
+    test ecx, ecx
+    jz .amo_maxu_done
+    call emit_store_rd
+.amo_maxu_done:
+    jmp .calc_size
 
 ;==============================================================================
 ; NOP
@@ -3946,6 +6001,7 @@ translate_instruction:
 ; Translate a 16-bit compressed RISC-V instruction to x86-64
 ; Input:  DI = 16-bit compressed instruction
 ;         RSI = output buffer pointer
+;         RDX = current PC (for error messages)
 ; Output: RAX = bytes written
 ;==============================================================================
 translate_compressed:
@@ -3958,6 +6014,7 @@ translate_compressed:
     mov r12, rsi                ; r12 = output pointer
     movzx r13d, di              ; r13d = instruction
     mov r14, rsi                ; r14 = buffer start for size calc
+    mov r15, rdx                ; r15 = current PC
 
     ; Extract quadrant (bits 1:0)
     mov eax, r13d
@@ -3972,7 +6029,88 @@ translate_compressed:
     cmp eax, 0x2
     je .c_quadrant2
 
-    ; Unknown quadrant - emit INT3
+    ; Unknown quadrant (0x3 = 32-bit, shouldn't happen here)
+    push rax
+    push r12
+    sub rsp, 48
+
+    ; Format: "ERR: PC=XXXXXXXX Cinst=XXXX q=X\n"
+    mov byte [num_buffer], 'E'
+    mov byte [num_buffer+1], 'R'
+    mov byte [num_buffer+2], 'R'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], ' '
+    mov byte [num_buffer+5], 'P'
+    mov byte [num_buffer+6], 'C'
+    mov byte [num_buffer+7], '='
+
+    ; Print PC (r15) as 8 hex digits
+    mov eax, r15d
+    mov ecx, 8
+    lea rsi, [num_buffer+15]
+.c_unk_pc_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .c_unk_pc_dig
+    add dl, 'A' - 10
+    jmp .c_unk_pc_st
+.c_unk_pc_dig:
+    add dl, '0'
+.c_unk_pc_st:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .c_unk_pc_hex
+
+    mov byte [num_buffer+16], ' '
+    mov byte [num_buffer+17], 'C'
+    mov byte [num_buffer+18], 'i'
+    mov byte [num_buffer+19], 'n'
+    mov byte [num_buffer+20], 's'
+    mov byte [num_buffer+21], 't'
+    mov byte [num_buffer+22], '='
+
+    ; Print compressed instruction (r13d) as 4 hex digits
+    mov eax, r13d
+    mov ecx, 4
+    lea rsi, [num_buffer+26]
+.c_unk_inst_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .c_unk_inst_dig
+    add dl, 'A' - 10
+    jmp .c_unk_inst_st
+.c_unk_inst_dig:
+    add dl, '0'
+.c_unk_inst_st:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .c_unk_inst_hex
+
+    mov byte [num_buffer+27], ' '
+    mov byte [num_buffer+28], 'q'
+    mov byte [num_buffer+29], '='
+    mov eax, r13d
+    and eax, 0x3
+    add al, '0'
+    mov [num_buffer+30], al
+    mov byte [num_buffer+31], 10
+
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 32
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop r12
+    pop rax
+
     mov byte [r12], 0xCC
     mov rax, 1
     jmp .c_done
@@ -4186,12 +6324,31 @@ translate_compressed:
     mov [r12+2], eax
     add r12, 6
 
+    ; Bounds check for C.LW
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB9
+    mov dword [r12+2], 0x07FFFFFC
+    mov dword [r12+6], 0
+    add r12, 10
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xC8
+    add r12, 3
+    mov byte [r12], 0x73
+    mov byte [r12+1], 0x06
+    add r12, 2
     ; Load 32-bit sign-extended from [r14+rax]
     mov byte [r12], 0x49        ; REX.WB
     mov byte [r12+1], 0x63      ; MOVSXD
     mov byte [r12+2], 0x04      ; ModRM: SIB mode
     mov byte [r12+3], 0x06      ; SIB: base=r14, index=rax
     add r12, 4
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 0x02
+    add r12, 2
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
 
     push rcx
     call .c_emit_store_rd
@@ -4246,12 +6403,31 @@ translate_compressed:
     mov [r12+2], eax
     add r12, 6
 
+    ; Bounds check for C.LD
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB9
+    mov dword [r12+2], 0x07FFFFF8
+    mov dword [r12+6], 0
+    add r12, 10
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xC8
+    add r12, 3
+    mov byte [r12], 0x73
+    mov byte [r12+1], 0x06
+    add r12, 2
     ; Load 64-bit from [r14+rax]
     mov byte [r12], 0x49        ; REX.WB
     mov byte [r12+1], 0x8B      ; MOV
     mov byte [r12+2], 0x04      ; ModRM: SIB mode
     mov byte [r12+3], 0x06      ; SIB: base=r14, index=rax
     add r12, 4
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 0x02
+    add r12, 2
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
 
     push rcx
     call .c_emit_store_rd
@@ -4262,6 +6438,7 @@ translate_compressed:
 ; C.SW: sw rs2', offset(rs1')
 ;------------------------------------------------------------------------------
 .c_sw:
+    inc qword [c_sw_count]
     ; rs2' = bits 4:2, rs1' = bits 9:7
     mov edx, r13d
     shr edx, 2
@@ -4332,12 +6509,115 @@ translate_compressed:
     mov byte [r12+3], 0x0E      ; SIB: base=r14, index=rcx
     add r12, 4
 
+    ; === C.SW Corruption detection ===
+    ; Read back: mov r11d, [r14+rcx] (45 8B 1C 0E)
+    mov byte [r12], 0x45
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x1C
+    mov byte [r12+3], 0x0E
+    add r12, 4
+
+    ; Compare: cmp r11d, eax (44 39 D8)
+    mov byte [r12], 0x44
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xD8
+    add r12, 3
+
+    ; je skip (74 XX) - no corruption, skip capture
+    mov byte [r12], 0x74
+    mov byte [r12+1], 0       ; placeholder for offset
+    lea r11, [r12+1]          ; save patch location
+    add r12, 2
+
+    ; Check if already captured: mov r10, csw_corrupt_captured
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [csw_corrupt_captured]
+    mov [r12+2], rax
+    add r12, 10
+    ; cmp byte [r10], 0 (41 80 3A 00)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x80
+    mov byte [r12+2], 0x3A
+    mov byte [r12+3], 0x00
+    add r12, 4
+    ; jne skip2 (75 XX)
+    mov byte [r12], 0x75
+    mov byte [r12+1], 0       ; placeholder
+    push r11                  ; save first patch
+    lea r11, [r12+1]          ; save second patch location
+    add r12, 2
+
+    ; Set captured: mov byte [r10], 1 (41 C6 02 01)
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0xC6
+    mov byte [r12+2], 0x02
+    mov byte [r12+3], 0x01
+    add r12, 4
+
+    ; Save address: mov [csw_corrupt_addr], rcx
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [csw_corrupt_addr]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x0A          ; mov [r10], rcx
+    add r12, 3
+
+    ; Save stored value: mov [csw_corrupt_stored], eax
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [csw_corrupt_stored]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x41
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x02          ; mov [r10], eax
+    add r12, 3
+
+    ; Save readback: re-read and save
+    ; mov r11d, [r14+rcx] (45 8B 1C 0E)
+    mov byte [r12], 0x45
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x1C
+    mov byte [r12+3], 0x0E
+    add r12, 4
+    ; mov [csw_corrupt_readback], r11d
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0xBA
+    lea rax, [csw_corrupt_readback]
+    mov [r12+2], rax
+    add r12, 10
+    mov byte [r12], 0x45
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x1A          ; mov [r10], r11d
+    add r12, 3
+
+    ; Patch second jne
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+    pop r11                   ; restore first patch location
+
+    ; .skip2:
+    ; Patch first je
+    mov rax, r12
+    sub rax, r11
+    dec rax
+    mov [r11], al
+
+    ; .skip:
+
     jmp .c_calc_size
 
 ;------------------------------------------------------------------------------
 ; C.SD: sd rs2', offset(rs1')
 ;------------------------------------------------------------------------------
 .c_sd:
+    inc qword [c_sd_count]
     mov edx, r13d
     shr edx, 2
     and edx, 0x7
@@ -5309,6 +7589,60 @@ translate_compressed:
     shr ecx, 7
     and ecx, 0x1F
 
+    ; Debug: print when C.LDSP loads ra (DISABLED for perf)
+    jmp .skip_ldsp_ra_debug
+    cmp ecx, 1
+    jne .skip_ldsp_ra_debug
+    push rax
+    push rcx
+    push rdx
+    sub rsp, 48
+    mov byte [num_buffer], 'L'
+    mov byte [num_buffer+1], 'D'
+    mov byte [num_buffer+2], 'S'
+    mov byte [num_buffer+3], 'P'
+    mov byte [num_buffer+4], '_'
+    mov byte [num_buffer+5], 'R'
+    mov byte [num_buffer+6], 'A'
+    mov byte [num_buffer+7], ' '
+    mov byte [num_buffer+8], 'P'
+    mov byte [num_buffer+9], 'C'
+    mov byte [num_buffer+10], ':'
+    mov rax, r13
+    mov ecx, 6
+    lea rsi, [num_buffer+16]
+.ldsp_ra_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .ldsp_ra_d
+    add dl, 'A' - 10
+    jmp .ldsp_ra_s
+.ldsp_ra_d:
+    add dl, '0'
+.ldsp_ra_s:
+    mov [rsi], dl
+    shr eax, 4
+    dec rsi
+    dec ecx
+    jnz .ldsp_ra_hex
+    mov byte [num_buffer+17], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 18
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rdx
+    pop rcx
+    pop rax
+    ; Restore ecx (rd)
+    mov ecx, r13d
+    shr ecx, 7
+    and ecx, 0x1F
+.skip_ldsp_ra_debug:
+
     test ecx, ecx
     jz .c_emit_nop
 
@@ -5346,12 +7680,31 @@ translate_compressed:
     mov [r12+2], eax
     add r12, 6
 
+    ; Bounds check for C.LDSP
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0xB9
+    mov dword [r12+2], 0x07FFFFF8
+    mov dword [r12+6], 0
+    add r12, 10
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x39
+    mov byte [r12+2], 0xC8
+    add r12, 3
+    mov byte [r12], 0x73
+    mov byte [r12+1], 0x06
+    add r12, 2
     ; Load 64-bit from [r14+rax] (r14 = guest memory base)
     mov byte [r12], 0x49        ; REX.WB
     mov byte [r12+1], 0x8B      ; MOV
     mov byte [r12+2], 0x04      ; ModRM: SIB mode
     mov byte [r12+3], 0x06      ; SIB: base=r14, index=rax
     add r12, 4
+    mov byte [r12], 0xEB
+    mov byte [r12+1], 0x02
+    add r12, 2
+    mov byte [r12], 0x31
+    mov byte [r12+1], 0xC0
+    add r12, 2
 
     push rcx
     call .c_emit_store_rd
@@ -5386,8 +7739,14 @@ translate_compressed:
 .c_cr_bit12_set:
     ; bit 12 = 1: C.EBREAK, C.JALR, or C.ADD
     test ecx, ecx
-    jz .c_ebreak                ; rs1 == 0: C.EBREAK
+    jnz .c_cr_rs1_nonzero       ; rs1 != 0: check for JALR or ADD
 
+    ; rs1 == 0: check rs2 for EBREAK vs HINT
+    test edx, edx
+    jz .c_ebreak                ; rs1 == 0, rs2 == 0: C.EBREAK
+    jmp .c_emit_nop             ; rs1 == 0, rs2 != 0: HINT (NOP)
+
+.c_cr_rs1_nonzero:
     test edx, edx
     jz .c_jalr                  ; rs2 == 0: C.JALR
     jmp .c_add                  ; C.ADD
@@ -5452,6 +7811,30 @@ translate_compressed:
     ; Save return address (PC + 2) to ra (x1)
     ; Then jump to rs1
 
+    push rcx                ; Save rs1
+
+    ; First, save return address (PC + 2) to ra (x1)
+    ; Load current PC from [r15], add 2, store to x1
+    ; Emit: mov rcx, [r15]
+    mov byte [r12], 0x49
+    mov byte [r12+1], 0x8B
+    mov byte [r12+2], 0x0F
+    add r12, 3
+    ; Emit: add rcx, 2
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x83
+    mov byte [r12+2], 0xC1
+    mov byte [r12+3], 0x02
+    add r12, 4
+    ; Emit: mov [rbx + 8], rcx  (store to ra = x1, offset 8)
+    mov byte [r12], 0x48
+    mov byte [r12+1], 0x89
+    mov byte [r12+2], 0x4B
+    mov byte [r12+3], 8
+    add r12, 4
+
+    pop rcx                 ; Restore rs1
+
     ; Load rs1 into RAX - handle disp8/disp32
     mov eax, ecx
     shl eax, 3              ; eax = rs1 * 8
@@ -5479,7 +7862,6 @@ translate_compressed:
     mov byte [r12+2], 0x07
     add r12, 3
 
-    ; Note: Return address should be stored - but we handle this at block level
     jmp .c_calc_size
 
 .c_add:
@@ -5550,6 +7932,7 @@ translate_compressed:
 ; C.SWSP: sw rs2, offset(sp)
 ;------------------------------------------------------------------------------
 .c_swsp:
+    inc qword [c_swsp_count]
     mov edx, r13d
     shr edx, 2
     and edx, 0x1F               ; rs2
@@ -5622,6 +8005,7 @@ translate_compressed:
 ; C.SDSP: sd rs2, offset(sp)
 ;------------------------------------------------------------------------------
 .c_sdsp:
+    inc qword [c_sdsp_count]
     mov edx, r13d
     shr edx, 2
     and edx, 0x1F
@@ -5784,8 +8168,8 @@ emit_load_rs1:
 ;==============================================================================
 emit_store_rd:
     ; Store RAX to [RBX + rd*8]
-    ; ECX = rd
-    mov r15d, ecx
+    ; ECX = rd (preserved)
+    ; Note: Do NOT clobber r15 - it holds the block cache pointer!
     mov eax, ecx
     shl eax, 3              ; eax = rd * 8
 
@@ -5817,7 +8201,6 @@ emit_store_rd:
 emit_load_reg_to_rax:
     test ecx, ecx
     jz .load_zero_rax
-
     mov eax, ecx
     shl eax, 3              ; offset = reg * 8
 
@@ -5856,7 +8239,6 @@ emit_load_reg_to_rax:
 emit_load_reg_to_rcx:
     test ecx, ecx
     jz .load_zero_rcx
-
     mov eax, ecx
     shl eax, 3              ; offset = reg * 8
 
@@ -5896,7 +8278,6 @@ emit_load_reg_to_rcx:
 emit_load_reg_to_rdx:
     test ecx, ecx
     jz .load_zero_rdx
-
     mov eax, ecx
     shl eax, 3              ; offset = reg * 8
 
@@ -6129,6 +8510,10 @@ init_block_cache:
     push rdi                        ; Callee-saved on Windows
     sub rsp, 40                     ; Shadow space for Windows calls
 
+    ; Initialize path_buffer_ptr
+    lea rax, [path_buffer]
+    mov [path_buffer_ptr], rax
+
     ; Zero out the block cache (mark all entries invalid)
     lea rdi, [block_cache]
     mov rcx, BLOCK_CACHE_SIZE * BLOCK_ENTRY_SIZE / 8
@@ -6252,6 +8637,46 @@ translate_block:
     push r14
     push r15
 
+    ; DEBUG: Print "PC:XXXXXXXX" with entry PC (DISABLED)
+    jmp .skip_pc_entry_debug
+    push rdi
+    push rsi
+    sub rsp, 48
+    mov byte [num_buffer], 'P'
+    mov byte [num_buffer+1], 'C'
+    mov byte [num_buffer+2], ':'
+    ; Print rdi (entry PC) as 8 hex digits
+    mov rax, rdi
+    mov ecx, 8
+    lea rsi, [num_buffer+10]
+.pc_entry_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .pc_entry_d
+    add dl, 'A' - 10
+    jmp .pc_entry_s
+.pc_entry_d:
+    add dl, '0'
+.pc_entry_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .pc_entry_hex
+    mov byte [num_buffer+11], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 12
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rsi
+    pop rdi
+.skip_pc_entry_debug:
+    ; END DEBUG
+
     mov [rbp-8], rdi                ; Save start PC
     mov [rbp-16], rsi               ; Save guest memory pointer
 
@@ -6275,6 +8700,14 @@ translate_block:
     mov r12, [code_buf_ptr]         ; R12 = output pointer (start of this block)
     mov [r15 + BLOCK_CODE_PTR], r12
 
+    ; REGISTER CACHING PROLOGUE: DISABLED - adds overhead for loops not using a0-a3
+    ; ; Emit: mov r8, [rbx + 80]   (4C 8B 43 50) - a0
+    ; mov byte [r12], 0x4C
+    ; mov byte [r12+1], 0x8B
+    ; mov byte [r12+2], 0x43
+    ; mov byte [r12+3], 0x50          ; x10 * 8 = 80
+    ; ; etc... (disabled for now)
+
     ; Store start PC
     mov rax, [rbp-8]
     mov [r15 + BLOCK_START_PC], rax
@@ -6295,6 +8728,78 @@ translate_block:
     ; Fetch instruction from guest memory at current PC
     mov eax, [r14 + r13]            ; Load 32-bit instruction
     mov [rbp-24], eax               ; Save instruction
+
+    ; Debug: print instruction for key blocks (DISABLED for perf)
+    jmp .skip_insn_debug
+    cmp qword [rbp-8], 0x1A854
+    je .do_insn_debug
+    cmp qword [rbp-8], 0x107D4
+    je .do_insn_debug
+    cmp qword [rbp-8], 0x1A850
+    je .do_insn_debug
+    cmp qword [rbp-8], 0x10762
+    je .do_insn_debug
+    cmp qword [rbp-8], 0x1075C
+    jne .skip_insn_debug
+.do_insn_debug:
+    cmp r8d, 10
+    ja .skip_insn_debug
+    ; Print "I:XXXXXX XXXXXXXX" (PC and instruction)
+    push rax
+    push rcx
+    push r8
+    sub rsp, 48
+    mov byte [num_buffer], 'I'
+    mov byte [num_buffer+1], ':'
+    mov rax, r13                    ; Current PC
+    mov ecx, 6
+    lea rsi, [num_buffer+7]
+.insn_pc_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .insn_pc_d
+    add dl, 'A' - 10
+    jmp .insn_pc_s
+.insn_pc_d:
+    add dl, '0'
+.insn_pc_s:
+    mov [rsi], dl
+    shr eax, 4
+    dec rsi
+    dec ecx
+    jnz .insn_pc_hex
+    mov byte [num_buffer+8], ' '
+    mov eax, [rbp-24]               ; Instruction
+    mov ecx, 8
+    lea rsi, [num_buffer+16]
+.insn_val_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .insn_val_d
+    add dl, 'A' - 10
+    jmp .insn_val_s
+.insn_val_d:
+    add dl, '0'
+.insn_val_s:
+    mov [rsi], dl
+    shr eax, 4
+    dec rsi
+    dec ecx
+    jnz .insn_val_hex
+    mov byte [num_buffer+17], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 18
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop r8
+    pop rcx
+    pop rax
+.skip_insn_debug:
 
     ; Check if this is a compressed instruction (bits[1:0] != 11)
     mov ecx, eax
@@ -6321,6 +8826,7 @@ translate_block:
     ; Not a block-ender - translate normally
     mov edi, eax                    ; instruction
     mov rsi, r12                    ; output buffer
+    mov rdx, r13                    ; current PC (for AUIPC)
     call translate_instruction
     add r12, rax                    ; Advance output pointer
 
@@ -6392,6 +8898,7 @@ translate_block:
     ; Translate compressed instruction
     movzx edi, word [rbp-24]        ; 16-bit instruction
     mov rsi, r12                    ; output buffer
+    mov rdx, r13                    ; current PC
     call translate_compressed
     add r12, rax                    ; Advance output pointer
 
@@ -6400,6 +8907,50 @@ translate_block:
     jmp .translate_loop
 
 .is_jal:
+    ; Debug: print when translating JAL at PC near 0x107DE (DISABLED for perf)
+    jmp .skip_jal_debug
+    cmp r13d, 0x107D0
+    jb .skip_jal_debug
+    cmp r13d, 0x107F0
+    ja .skip_jal_debug
+    push rax
+    push rcx
+    push rdx
+    sub rsp, 48
+    mov byte [num_buffer], 'J'
+    mov byte [num_buffer+1], 'A'
+    mov byte [num_buffer+2], 'L'
+    mov byte [num_buffer+3], ':'
+    mov eax, r13d
+    mov ecx, 8
+    lea rsi, [num_buffer+11]
+.jal_dbg_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .jal_dbg_d
+    add dl, 'A' - 10
+    jmp .jal_dbg_s
+.jal_dbg_d:
+    add dl, '0'
+.jal_dbg_s:
+    mov [rsi], dl
+    shr eax, 4
+    dec rsi
+    dec ecx
+    jnz .jal_dbg_hex
+    mov byte [num_buffer+12], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 13
+    lea r9, [bytes_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rdx
+    pop rcx
+    pop rax
+.skip_jal_debug:
     ; JAL - unconditional jump
     ; First, emit code to store current PC to rv_pc
     ; Emit: mov qword [r15], current_pc
@@ -6412,6 +8963,7 @@ translate_block:
     ; Now translate the JAL
     mov edi, [rbp-24]
     mov rsi, r12
+    mov rdx, r13                    ; current PC
     call translate_instruction
     add r12, rax
 
@@ -6440,6 +8992,7 @@ translate_block:
     ; Now translate the JALR
     mov edi, [rbp-24]
     mov rsi, r12
+    mov rdx, r13                    ; current PC
     call translate_instruction
     add r12, rax
 
@@ -6460,6 +9013,7 @@ translate_block:
     ; Now translate the branch
     mov edi, [rbp-24]
     mov rsi, r12
+    mov rdx, r13                    ; current PC
     call translate_instruction
     add r12, rax
 
@@ -6498,6 +9052,7 @@ translate_block:
     ; This is a CSR instruction, translate normally
     mov edi, [rbp-24]
     mov rsi, r12
+    mov rdx, r13                    ; current PC
     call translate_instruction
     add r12, rax
     add r13, 4
@@ -6508,7 +9063,8 @@ translate_block:
     ; Emit code to store NEXT PC (after ECALL) to rv_pc
     ; This is r13 + 4 (ECALL is always 4 bytes)
 
-    ; Debug: print "E:XXXXXXXX" for ECALL translation with next PC
+    ; Debug: print "E:XXXXXXXX" for ECALL translation with next PC (DISABLED)
+    jmp .skip_ecall_debug
     push r13
     push r12
     sub rsp, 48
@@ -6542,6 +9098,7 @@ translate_block:
     add rsp, 48
     pop r12
     pop r13
+.skip_ecall_debug:
 
     lea eax, [r13 + 4]          ; EAX = next PC
     mov byte [r12], 0x49        ; REX.WB
@@ -6553,6 +9110,7 @@ translate_block:
     ; Translate the ECALL/EBREAK
     mov edi, [rbp-24]
     mov rsi, r12
+    mov rdx, r13                    ; current PC
     call translate_instruction
     add r12, rax
 
@@ -6823,6 +9381,7 @@ translate_block:
     ; Translate the C.JR/C.JALR
     movzx edi, word [rbp-24]
     mov rsi, r12
+    mov rdx, r13                    ; current PC
     call translate_compressed
     add r12, rax
 
@@ -6835,7 +9394,21 @@ translate_block:
     mov [r15 + BLOCK_NEXT_PC], r13
     mov dword [r15 + BLOCK_EXIT_TYPE], EXIT_JUMP
 
+    ; BUG FIX: Emit x86 code to update rv_pc at runtime!
+    ; Emit: mov qword [r15], next_pc
+    ; REX.W prefix (48), MOV r/m64,imm64 (C7 /0), ModRM for [r15] (07)
+    mov byte [r12], 0x49            ; REX.WB for 64-bit and r15
+    mov byte [r12+1], 0xC7          ; MOV r/m64, imm32 (sign-extended)
+    mov byte [r12+2], 0x07          ; ModRM: [r15]
+    mov [r12+3], r13d               ; Store next PC (low 32 bits)
+    add r12, 7
+
 .finish_block:
+    ; REGISTER CACHING EPILOGUE: DISABLED - adds overhead for loops not using a0-a3
+    ; ; Emit: mov [rbx + 80], r8   (4C 89 43 50) - a0
+    ; mov byte [r12], 0x4C
+    ; ... (disabled for now)
+
     ; Emit block epilogue: JMP to link_trampoline (can be patched for linking)
     ; Store the jmp address so we can patch it later
     mov [r15 + BLOCK_LINK_ADDR], r12
@@ -6883,6 +9456,7 @@ translate_block:
 ;         RDX = pointer to rv_regs array
 ;         RCX = pointer to rv_pc
 ;         R8  = max blocks to execute (0 = unlimited)
+;         R9  = pointer to rv_fp_regs array (FP registers)
 ; Output: RAX = final PC value
 ;
 ; "Round and round the blocks we go, where we stop, nobody knows"
@@ -6890,27 +9464,63 @@ translate_block:
 execute_blocks:
     push rbp
     mov rbp, rsp
-    sub rsp, 80
+    sub rsp, 96                     ; Increased for fp_regs
     push rbx
     push r12
     push r13
     push r14
     push r15
 
-    ; Save parameters
+    ; Save parameters FIRST (before any function calls)
     mov [rbp-8], rdi            ; start PC
     mov [rbp-16], rsi           ; guest memory
     mov [rbp-24], rdx           ; rv_regs
     mov [rbp-32], rcx           ; rv_pc pointer
     mov [rbp-40], r8            ; max blocks
+    mov [rbp-48], r9            ; fp_regs
 
-    ; Set initial PC
-    mov rax, rdi
-    mov rcx, [rbp-32]
+    ; DEBUG: Print "EXE:" at entry (DISABLED)
+    jmp .skip_exe_debug
+    sub rsp, 48
+    mov byte [num_buffer], 'E'
+    mov byte [num_buffer+1], 'X'
+    mov byte [num_buffer+2], 'E'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 5
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+.skip_exe_debug:
+    ; END DEBUG
+
+    ; Set initial PC (use saved values after WriteFile)
+    mov rax, [rbp-8]        ; start PC from saved
+    mov rcx, [rbp-32]       ; rv_pc pointer from saved
     mov [rcx], rax
 
     ; R12 = block count
     xor r12d, r12d
+
+    ; DEBUG: Print "LP:" before exec_loop (DISABLED)
+    jmp .skip_lp_debug
+    sub rsp, 48
+    mov byte [num_buffer], 'L'
+    mov byte [num_buffer+1], 'P'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 4
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+.skip_lp_debug:
+    ; END DEBUG
 
 .exec_loop:
     ; Update debug counters
@@ -6926,13 +9536,13 @@ execute_blocks:
     mov [rcx + rdx*8], rax
     inc qword [pc_history_idx]
 
-    ; Debug: print PC for blocks X-Y
-    ; jmp .no_pc_print
-    cmp r12, 9253
+    ; Debug: print PC, ra, sp for blocks 1-100 (ENABLED for debug)
+    jmp .no_pc_print  ; DISABLED
+    cmp r12, 1
     jb .no_pc_print
-    cmp r12, 9260
+    cmp r12, 100
     ja .no_pc_print
-    ; Print "BXXXX P:XXXXXX\n"
+    ; Print "BXXXX P:XXXXXX R:XXXXXXXX S:XXXXXXXX\n"
     push r12
     sub rsp, 48
     ; Block number first
@@ -6976,10 +9586,56 @@ execute_blocks:
     shr eax, 4
     dec edi
     jnz .pc_hex_loop
-    mov byte [num_buffer+14], 10    ; newline
+    ; Add " R:" and ra value (8 hex digits)
+    mov byte [num_buffer+14], ' '
+    mov byte [num_buffer+15], 'R'
+    mov byte [num_buffer+16], ':'
+    mov rax, [rbp-24]               ; Get rv_regs pointer (saved earlier)
+    mov rax, [rax + 8]              ; ra = x1, offset 8
+    mov edi, 8
+    lea rsi, [num_buffer+24]
+.ra_hex_loop:
+    mov ecx, eax
+    and ecx, 0xF
+    cmp cl, 10
+    jb .ra_hex_digit
+    add cl, 'A' - 10
+    jmp .ra_hex_store
+.ra_hex_digit:
+    add cl, '0'
+.ra_hex_store:
+    mov [rsi], cl
+    dec rsi
+    shr eax, 4
+    dec edi
+    jnz .ra_hex_loop
+    ; Add " S:" and sp value (8 hex digits)
+    mov byte [num_buffer+25], ' '
+    mov byte [num_buffer+26], 'S'
+    mov byte [num_buffer+27], ':'
+    mov rax, [rbp-24]               ; Get rv_regs pointer
+    mov rax, [rax + 16]             ; sp = x2, offset 16
+    mov edi, 8
+    lea rsi, [num_buffer+35]
+.sp_hex_loop:
+    mov ecx, eax
+    and ecx, 0xF
+    cmp cl, 10
+    jb .sp_hex_digit
+    add cl, 'A' - 10
+    jmp .sp_hex_store
+.sp_hex_digit:
+    add cl, '0'
+.sp_hex_store:
+    mov [rsi], cl
+    dec rsi
+    shr eax, 4
+    dec edi
+    jnz .sp_hex_loop
+    mov byte [num_buffer+36], 10    ; newline
     mov rcx, [stdout_handle]
     lea rdx, [num_buffer]
-    mov r8d, 15
+    mov r8d, 37
     lea r9, [stdout_written]
     mov qword [rsp+32], 0
     call WriteFile
@@ -7046,12 +9702,33 @@ execute_blocks:
     ; Translate/lookup block
     mov rsi, [rbp-16]           ; guest memory
     call translate_block
+
+    ; DEBUG: Print "TB:" after translate_block returns (DISABLED)
+    jmp .skip_tb_debug
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'T'
+    mov byte [num_buffer+1], 'B'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 4
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+.skip_tb_debug:
+    ; END DEBUG
+
     test rax, rax
     jz .xlate_failed            ; No block = stop
 
     mov [rbp-48], rax           ; Save block pointer
 
-    ; Debug: for blocks 9253-9258, print exit type
+    ; Debug: for blocks 9253-9258, print exit type (DISABLED)
+    jmp .skip_exit_debug
     cmp r12, 9253
     jb .skip_exit_debug
     cmp r12, 9258
@@ -7079,6 +9756,114 @@ execute_blocks:
     mov rbx, [rbp-24]           ; RBX = rv_regs
     mov r15, [rbp-32]           ; R15 = rv_pc pointer
     mov r14, [rbp-16]           ; R14 = guest memory (for loads/stores)
+    mov r13, [rbp-48]           ; R13 = fp_regs (for FP operations)
+
+    ; TEST 1: Verify store/load works with r14 at different offsets
+    ; Only do this once (check if already done)
+    cmp byte [r14 + 0x100], 'T'         ; Check test marker at small offset
+    je .skip_test1
+    mov byte [r14 + 0x100], 'T'         ; Set test marker
+
+    ; Test 1a: small offset (should work)
+    mov byte [r14 + 0x1000], 'A'
+    movzx eax, byte [r14 + 0x1000]
+    mov [num_buffer+10], al             ; Should be 'A'
+
+    ; Test 1b: medium offset
+    mov byte [r14 + 0x50000], 'B'
+    movzx eax, byte [r14 + 0x50000]
+    mov [num_buffer+11], al             ; Should be 'B'
+
+    ; Test 1c: exact address Doom uses (0x6FE020)
+    mov byte [r14 + 0x6FE020], 'C'
+    movzx eax, byte [r14 + 0x6FE020]
+    mov [num_buffer+12], al             ; Should be 'C'
+
+    ; Print result: "TS:ABC" where A=0x1000, B=0x50000, C=0x6FE020
+    sub rsp, 48
+    mov byte [num_buffer], 'T'
+    mov byte [num_buffer+1], 'S'
+    mov byte [num_buffer+2], ':'
+    ; Results already at num_buffer+10,+11,+12,+13 (newline)
+    ; Copy them to positions 3,4,5,6
+    mov al, [num_buffer+10]
+    mov [num_buffer+3], al
+    mov al, [num_buffer+11]
+    mov [num_buffer+4], al
+    mov al, [num_buffer+12]
+    mov [num_buffer+5], al
+    mov byte [num_buffer+6], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 7
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+.skip_test1:
+
+    ; TEST 2: Verify store via register (like translated code does)
+    ; Only do this once - check if marker at 0x101 is set
+    cmp byte [r14 + 0x101], 'R'
+    je .skip_store_test
+
+    mov byte [r14 + 0x101], 'R'         ; Set marker
+
+    ; Set rv_regs[10] (x10) = 0x2000 (destination address)
+    ; Set rv_regs[11] (x11) = 'D' (value to store)
+    ; Then do what translated SB would: load x10 into rax, load x11 into rcx, store [r14+rax], cl
+    mov qword [rbx + 10*8], 0x2000      ; x10 = address
+    mov qword [rbx + 11*8], 'D'         ; x11 = value 'D'
+
+    ; Simulate translated SB: sb x11, 0(x10)
+    mov rax, [rbx + 10*8]               ; rax = x10 value = 0x2000
+    ; add rax, 0                        ; immediate = 0 (skip since zero)
+    mov rcx, [rbx + 11*8]               ; rcx = x11 value = 'D'
+    mov [r14 + rax], cl                 ; store byte: [guest_mem + 0x2000] = 'D'
+
+    ; Read it back and print "TR:D" if successful
+    movzx eax, byte [r14 + 0x2000]
+    mov [num_buffer+13], al             ; Save result
+
+    sub rsp, 48
+    mov byte [num_buffer], 'T'
+    mov byte [num_buffer+1], 'R'
+    mov byte [num_buffer+2], ':'
+    mov al, [num_buffer+13]
+    mov [num_buffer+3], al
+    mov byte [num_buffer+4], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 5
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+
+    ; Clean up x10/x11 (set back to 0)
+    mov qword [rbx + 10*8], 0
+    mov qword [rbx + 11*8], 0
+
+.skip_store_test:
+
+    ; DEBUG: Print "ST:" after setup (DISABLED)
+    jmp .skip_st_debug
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'T'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 4
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+.skip_st_debug:
+    ; END DEBUG
 
     ; Debug: for block 9256, print r15 value
     cmp r12, 999999999
@@ -7120,14 +9905,35 @@ execute_blocks:
     mov rax, [rbp-48]
     mov rax, [rax + BLOCK_CODE_PTR]
 
-    ; Debug: print block count every 2000 blocks
+    ; DEBUG: Print "CP:" after getting code pointer (DISABLED)
+    jmp .skip_cp_debug
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'C'
+    mov byte [num_buffer+1], 'P'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 4
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+.skip_cp_debug:
+    ; END DEBUG
+
+    ; Debug: print block count every 2000 blocks (DISABLED for performance)
+    ; To re-enable: change jmp to jne below
+    jmp .skip_blk_print
     push rax
     mov eax, r12d
     mov edx, 0
     mov ecx, 2000
     div ecx                     ; eax = r12 / 2000, edx = r12 % 2000
     test edx, edx
-    jnz .skip_blk_print
+    jnz .skip_blk_print_inner
     ; Print block number
     sub rsp, 48
     mov byte [num_buffer], 'B'
@@ -7156,8 +9962,9 @@ execute_blocks:
     mov qword [rsp+32], 0
     call WriteFile
     add rsp, 48
-.skip_blk_print:
+.skip_blk_print_inner:
     pop rax
+.skip_blk_print:
 
     ; Debug: print block# and PC for blocks 2424-2427
     ; DISABLED to reduce noise
@@ -7221,7 +10028,8 @@ execute_blocks:
 .no_r14_debug:
     pop rax                     ; Restore code pointer
 .exec_block_now:
-    ; Debug: print "X" marker every time block 2425 is about to execute
+    ; Debug: print "X" marker every time block 2425 is about to execute (DISABLED)
+    jmp .skip_before_debug
     cmp r12, 2425
     jne .skip_before_debug
     push rax
@@ -7325,7 +10133,8 @@ execute_blocks:
     add rsp, 48
     pop rax                     ; Restore code pointer
 .skip_before_debug:
-    ; Debug: print marker before block execution for blocks 9255-9258
+    ; Debug: print marker before block execution for blocks 9255-9258 (DISABLED)
+    jmp .skip_pre_call
     cmp r12, 9255
     jb .skip_pre_call
     cmp r12, 9258
@@ -7343,8 +10152,9 @@ execute_blocks:
     add rsp, 48
     pop rax
 .skip_pre_call:
-    ; Debug: dump x86 code for blocks 9253-9256 before execution
-    cmp r12, 9253
+    ; Debug: dump x86 code for blocks 9250-9256 before execution (DISABLED)
+    jmp .skip_code_dump
+    cmp r12, 9250
     jb .skip_code_dump
     cmp r12, 9256
     ja .skip_code_dump
@@ -7352,16 +10162,32 @@ execute_blocks:
     push rdi
     push rcx
     sub rsp, 48
-    ; Print "CODE:" header
+    ; Print "CP:" and code pointer value first
     mov byte [num_buffer], 'C'
-    mov byte [num_buffer+1], 'O'
-    mov byte [num_buffer+2], 'D'
-    mov byte [num_buffer+3], 'E'
-    mov byte [num_buffer+4], ':'
-    mov byte [num_buffer+5], 10
+    mov byte [num_buffer+1], 'P'
+    mov byte [num_buffer+2], ':'
+    mov rax, [rsp+64]           ; Get saved rax (code pointer)
+    mov ecx, 16
+    lea rsi, [num_buffer+18]
+.cp_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .cp_dig
+    add dl, 'A' - 10
+    jmp .cp_st
+.cp_dig:
+    add dl, '0'
+.cp_st:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .cp_hex
+    mov byte [num_buffer+19], 10
     mov rcx, [stdout_handle]
     lea rdx, [num_buffer]
-    mov r8d, 6
+    mov r8d, 20
     lea r9, [stdout_written]
     mov qword [rsp+32], 0
     call WriteFile
@@ -7543,20 +10369,485 @@ execute_blocks:
     pop rax
 .skip_code_dump:
 
-    call rax
-
-    ; Debug: print marker after block execution for blocks 9255-9258
-    cmp r12, 9255
-    jb .skip_post_call
-    cmp r12, 9258
-    ja .skip_post_call
+    ; Debug: print ra and r15 BEFORE block 95 or 150 (DISABLED for perf)
+    jmp .skip_ra_before
+    cmp r12, 150
+    je .do_ra_before
+    cmp r12, 95
+    jne .skip_ra_before
+.do_ra_before:
     push rax
+    push rcx
     sub rsp, 48
-    mov byte [num_buffer], '<'
-    mov byte [num_buffer+1], 10
+    ; Print "BPC:XXXXXX ET:X SZ:XXX" (block start PC, exit type, code size)
+    push rdi
+    mov rdi, [rbp-48]           ; block pointer
+    mov byte [num_buffer], 'B'
+    mov byte [num_buffer+1], 'P'
+    mov byte [num_buffer+2], 'C'
+    mov byte [num_buffer+3], ':'
+    mov rax, [rdi + 8]          ; BLOCK_START_PC at offset 8
+    mov ecx, 6
+    lea rsi, [num_buffer+9]
+.bpc_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .bpc_d
+    add dl, 'A' - 10
+    jmp .bpc_s
+.bpc_d:
+    add dl, '0'
+.bpc_s:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .bpc_hex
+    mov byte [num_buffer+10], ' '
+    mov byte [num_buffer+11], 'E'
+    mov byte [num_buffer+12], 'T'
+    mov byte [num_buffer+13], ':'
+    mov eax, [rdi + 28]         ; BLOCK_EXIT_TYPE at offset 28
+    add al, '0'
+    mov [num_buffer+14], al
+    mov byte [num_buffer+15], ' '
+    mov byte [num_buffer+16], 'S'
+    mov byte [num_buffer+17], 'Z'
+    mov byte [num_buffer+18], ':'
+    mov eax, [rdi + 24]         ; BLOCK_CODE_SIZE at offset 24
+    ; Print as decimal (3 digits)
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [num_buffer+19], al
+    mov eax, edx
+    mov ecx, 10
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [num_buffer+20], al
+    add dl, '0'
+    mov [num_buffer+21], dl
+    mov byte [num_buffer+22], 10
     mov rcx, [stdout_handle]
     lea rdx, [num_buffer]
-    mov r8d, 2
+    mov r8d, 23
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    pop rdi
+    ; Now print RB:
+    mov byte [num_buffer], 'R'
+    mov byte [num_buffer+1], 'B'
+    mov byte [num_buffer+2], ':'
+    mov rax, [rbx + 1*8]        ; ra = x1
+    mov ecx, 8
+    lea rsi, [num_buffer+10]
+.rab_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .rab_d
+    add dl, 'A' - 10
+    jmp .rab_s
+.rab_d:
+    add dl, '0'
+.rab_s:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .rab_hex
+    ; Add " r15:" and r15 value
+    mov byte [num_buffer+11], ' '
+    mov byte [num_buffer+12], 'r'
+    mov byte [num_buffer+13], '1'
+    mov byte [num_buffer+14], '5'
+    mov byte [num_buffer+15], ':'
+    mov rax, r15
+    mov ecx, 16
+    lea rsi, [num_buffer+31]
+.r15_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .r15_d
+    add dl, 'A' - 10
+    jmp .r15_s
+.r15_d:
+    add dl, '0'
+.r15_s:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .r15_hex
+    ; Add " pc:" and [r15] value
+    mov byte [num_buffer+32], ' '
+    mov byte [num_buffer+33], 'p'
+    mov byte [num_buffer+34], 'c'
+    mov byte [num_buffer+35], ':'
+    mov rax, [r15]              ; Current PC
+    mov ecx, 8
+    lea rsi, [num_buffer+43]
+.pc_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .pc_d
+    add dl, 'A' - 10
+    jmp .pc_s
+.pc_d:
+    add dl, '0'
+.pc_s:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .pc_hex
+    mov byte [num_buffer+44], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 45
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    ; Print "SP:XXXXXXXX STK8:XXXXXXXX" (sp value and [sp+8] in guest memory)
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'P'
+    mov byte [num_buffer+2], ':'
+    mov rax, [rbx + 2*8]        ; sp = x2
+    push rax                    ; Save sp for later
+    mov ecx, 8
+    lea rsi, [num_buffer+10]
+.sp_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sp_d
+    add dl, 'A' - 10
+    jmp .sp_s
+.sp_d:
+    add dl, '0'
+.sp_s:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .sp_hex
+    mov byte [num_buffer+11], ' '
+    mov byte [num_buffer+12], 'S'
+    mov byte [num_buffer+13], 'T'
+    mov byte [num_buffer+14], 'K'
+    mov byte [num_buffer+15], '8'
+    mov byte [num_buffer+16], ':'
+    pop rax                     ; Get sp back
+    add rax, 8                  ; sp + 8
+    add rax, r14                ; guest memory base
+    mov rax, [rax]              ; Load [sp+8] from guest memory
+    mov ecx, 8
+    lea rsi, [num_buffer+24]
+.stk8_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .stk8_d
+    add dl, 'A' - 10
+    jmp .stk8_s
+.stk8_d:
+    add dl, '0'
+.stk8_s:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .stk8_hex
+    mov byte [num_buffer+25], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 26
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    ; Also dump first 32 bytes of block code
+    mov byte [num_buffer], 'C'
+    mov byte [num_buffer+1], 'D'
+    mov byte [num_buffer+2], ':'
+    mov rdi, [rsp+56]           ; Get saved rax (block code ptr) from stack
+    add rdi, 200                ; Start from byte 200
+    mov rcx, 41                 ; Dump last 41 bytes (200-241)
+    lea rsi, [num_buffer+3]
+.blk_cd_loop:
+    push rcx
+    push rdi
+    movzx eax, byte [rdi]
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .blk_cd_d1
+    add dl, 'A' - 10
+    jmp .blk_cd_s1
+.blk_cd_d1:
+    add dl, '0'
+.blk_cd_s1:
+    mov [rsi], dl
+    inc rsi
+    and eax, 0xF
+    cmp al, 10
+    jb .blk_cd_d2
+    add al, 'A' - 10
+    jmp .blk_cd_s2
+.blk_cd_d2:
+    add al, '0'
+.blk_cd_s2:
+    mov [rsi], al
+    inc rsi
+    pop rdi
+    inc rdi
+    pop rcx
+    dec rcx
+    jnz .blk_cd_loop
+    mov byte [rsi], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 86                 ; 3 + 82 + 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rcx
+    pop rax
+.skip_ra_before:
+
+    ; DEBUG: Print "R14:" (DISABLED)
+    jmp .skip_r14_print
+    cmp r12, 1
+    jne .skip_r14_print
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'R'
+    mov byte [num_buffer+1], '1'
+    mov byte [num_buffer+2], '4'
+    mov byte [num_buffer+3], ':'
+    ; Print r14 as 16 hex digits
+    mov rax, r14
+    mov ecx, 16
+    lea rsi, [num_buffer+19]
+.r14_hex2:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .r14_d2
+    add dl, 'A' - 10
+    jmp .r14_s2
+.r14_d2:
+    add dl, '0'
+.r14_s2:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .r14_hex2
+    mov byte [num_buffer+20], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 21
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+.skip_r14_print:
+
+    ; DISABLED - first block debug
+    jmp .skip_bx_full_debug
+    cmp r12, 1
+    jne .skip_bx_full_debug
+    push rax
+    push rdi
+    sub rsp, 48
+    mov rdi, rax                ; rdi = code pointer
+    ; Print 128 bytes as hex (256 chars)
+    mov ecx, 128
+    lea rsi, [num_buffer]
+.dump_first_bytes:
+    movzx eax, byte [rdi]
+    push rcx
+    push rdi
+    ; High nibble
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .dfb_d1
+    add dl, 'A' - 10
+    jmp .dfb_s1
+.dfb_d1:
+    add dl, '0'
+.dfb_s1:
+    mov [rsi], dl
+    inc rsi
+    ; Low nibble
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .dfb_d2
+    add dl, 'A' - 10
+    jmp .dfb_s2
+.dfb_d2:
+    add dl, '0'
+.dfb_s2:
+    mov [rsi], dl
+    inc rsi
+    pop rdi
+    inc rdi
+    pop rcx
+    dec ecx
+    jnz .dump_first_bytes
+    mov byte [rsi], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 257                ; 256 + 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rdi
+    pop rax
+.skip_bx_full_debug:
+    ; Debug: verify r14 is correct before first few blocks
+    cmp r12d, 5
+    jae .skip_r14_check
+    ; Print "R14:XXXXXXXXXXXXXXXX\n"
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'R'
+    mov byte [num_buffer+1], '1'
+    mov byte [num_buffer+2], '4'
+    mov byte [num_buffer+3], ':'
+    mov rax, r14                ; Get r14 value
+    mov ecx, 16
+    lea rsi, [num_buffer+19]
+.r14chk_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .r14chk_d
+    add dl, 'A' - 10
+    jmp .r14chk_s
+.r14chk_d:
+    add dl, '0'
+.r14chk_s:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .r14chk_hex
+    mov byte [num_buffer+20], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 21
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rax
+.skip_r14_check:
+
+    jmp .real_call
+    ; Old code dump debug - disabled
+    push rax
+    push rdi
+    push rcx
+    sub rsp, 48
+    ; Print "X:" and code pointer as 16 hex digits
+    mov byte [num_buffer], 'X'
+    mov byte [num_buffer+1], ':'
+    mov rax, [rsp+64]           ; Get saved rax (code pointer)
+    mov rdi, rax                ; Save for byte dump
+    mov ecx, 16
+    lea rsi, [num_buffer+17]
+.xcp_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .xcp_d
+    add dl, 'A' - 10
+    jmp .xcp_s
+.xcp_d:
+    add dl, '0'
+.xcp_s:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .xcp_hex
+    mov byte [num_buffer+18], ' '
+    ; Now dump first 128 bytes of code
+    lea rsi, [num_buffer+19]
+    mov ecx, 128
+.dump_bytes:
+    movzx eax, byte [rdi]
+    push rcx
+    push rdi
+    ; High nibble
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .db_d1
+    add dl, 'A' - 10
+    jmp .db_s1
+.db_d1:
+    add dl, '0'
+.db_s1:
+    mov [rsi], dl
+    inc rsi
+    ; Low nibble
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .db_d2
+    add dl, 'A' - 10
+    jmp .db_s2
+.db_d2:
+    add dl, '0'
+.db_s2:
+    mov [rsi], dl
+    inc rsi
+    pop rdi
+    inc rdi
+    pop rcx
+    dec ecx
+    jnz .dump_bytes
+    mov byte [rsi], 10          ; newline
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 276                ; 2 + 16 + 1 + 256 + 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rcx
+    pop rdi
+    pop rax
+.skip_bx_debug:
+    ; END DEBUG
+
+.real_call:
+    call rax
+
+    ; Debug: print "OK:" after EVERY block (DISABLED)
+    jmp .skip_post_call
+    push rax
+    sub rsp, 48
+    mov byte [num_buffer], 'O'
+    mov byte [num_buffer+1], 'K'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 4
     lea r9, [stdout_written]
     mov qword [rsp+32], 0
     call WriteFile
@@ -7564,9 +10855,190 @@ execute_blocks:
     pop rax
 .skip_post_call:
 
-    ; Debug: detect when s4 (x20) CHANGES to corrupted value AFTER block execution
+    ; Debug: track ra becoming 0 (DISABLED)
+    jmp .skip_ra_done
+    mov rax, [rbx + 1*8]        ; ra = x1
+    test rax, rax
+    jnz .skip_ra_done           ; ra not zero - skip
+    ; ra is 0! Print "RA0:BBBBB P:XXXXXX S:XXXXXXXX\n" where BBBBB=block, P=PC, S=sp
+    push rcx
+    push rdi
+    push rsi
+    sub rsp, 48
+    mov byte [num_buffer], 'R'
+    mov byte [num_buffer+1], 'A'
+    mov byte [num_buffer+2], '0'
+    mov byte [num_buffer+3], ':'
+    mov eax, r12d               ; Block number
+    mov ecx, 5
+    lea rsi, [num_buffer+8]
+.ra0_dec:
+    xor edx, edx
+    mov edi, 10
+    div edi
+    add dl, '0'
+    mov [rsi], dl
+    dec rsi
+    dec ecx
+    jnz .ra0_dec
+    ; Add " P:"
+    mov byte [num_buffer+9], ' '
+    mov byte [num_buffer+10], 'P'
+    mov byte [num_buffer+11], ':'
+    ; Print PC in hex (6 digits)
+    mov rax, [r15]              ; Current PC
+    mov ecx, 6
+    lea rsi, [num_buffer+17]
+.ra0_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp edx, 10
+    jb .ra0_digit
+    add dl, 'A' - 10
+    jmp .ra0_store
+.ra0_digit:
+    add dl, '0'
+.ra0_store:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .ra0_hex
+    ; Add " S:" for sp
+    mov byte [num_buffer+18], ' '
+    mov byte [num_buffer+19], 'S'
+    mov byte [num_buffer+20], ':'
+    ; Print sp in hex (8 digits)
+    mov rax, [rbx + 2*8]        ; sp = x2
+    mov ecx, 8
+    lea rsi, [num_buffer+28]
+.ra0_sp_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp edx, 10
+    jb .ra0_sp_digit
+    add dl, 'A' - 10
+    jmp .ra0_sp_store
+.ra0_sp_digit:
+    add dl, '0'
+.ra0_sp_store:
+    mov [rsi], dl
+    shr rax, 4
+    dec rsi
+    dec ecx
+    jnz .ra0_sp_hex
+    mov byte [num_buffer+29], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 30
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rsi
+    pop rdi
+    pop rcx
+.skip_ra_done:
+
+    ; Debug: track a0 changes (DISABLED)
+    jmp .skip_a0_track_done
     push rax
     push rcx
+    mov rax, [rbx + 0x50]       ; a0 = x10, offset 0x50
+    cmp rax, [last_a0_value]
+    je .skip_a0_track           ; a0 unchanged
+    mov [last_a0_value], rax
+    ; Check if a0 == corrupt value
+    mov rcx, 0x0000038800000034
+    cmp rax, rcx
+    jne .skip_a0_track          ; Not the corrupt value
+    ; Print "A0C:BBBBB\n" where BBBBB is block number in decimal
+    push rdi
+    push rsi
+    sub rsp, 48
+    mov byte [num_buffer], 'A'
+    mov byte [num_buffer+1], '0'
+    mov byte [num_buffer+2], 'C'
+    mov byte [num_buffer+3], ':'
+    ; Print block number in decimal (5 digits)
+    mov eax, r12d
+    lea rsi, [num_buffer+8]
+    mov ecx, 5
+.a0c_dec:
+    xor edx, edx
+    mov edi, 10
+    div edi
+    add dl, '0'
+    mov [rsi], dl
+    dec rsi
+    dec ecx
+    jnz .a0c_dec
+    mov byte [num_buffer+9], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 10
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rsi
+    pop rdi
+.skip_a0_track:
+    pop rcx
+    pop rax
+.skip_a0_track_done:
+
+    ; Debug: track s4 for blocks 9240-9260 (DISABLED)
+    jmp .skip_s4_done
+    push rax
+    push rcx
+    cmp r12, 9240
+    jb .skip_s4_track
+    cmp r12, 9260
+    ja .skip_s4_track
+    ; Print block# and s4 value: "sN:XXXXXXXXXXXXXXXX\n"
+    push rdi
+    push rsi
+    sub rsp, 48
+    mov byte [num_buffer], 's'
+    ; Print last digit of block number
+    mov eax, r12d
+    mov ecx, 10
+    xor edx, edx
+    div ecx                     ; edx = r12 % 10
+    add dl, '0'
+    mov [num_buffer+1], dl
+    mov byte [num_buffer+2], ':'
+    ; Print s4 value (16 hex)
+    mov rax, [rbx + 0xA0]
+    mov ecx, 16
+    lea rsi, [num_buffer+18]
+.st_hex:
+    mov edi, eax
+    and edi, 0xF
+    cmp edi, 10
+    jb .st_dig
+    add edi, 'A' - 10
+    jmp .st_st
+.st_dig:
+    add edi, '0'
+.st_st:
+    mov [rsi], dil
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .st_hex
+    mov byte [num_buffer+19], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 20
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rsi
+    pop rdi
+.skip_s4_track:
     mov rax, [rbx + 0xA0]       ; s4 = x20, offset 0xA0 = 160
     ; Check if s4 changed from last block
     cmp rax, [last_s4_value]
@@ -7902,8 +11374,9 @@ execute_blocks:
 .skip_s4_after:
     pop rcx
     pop rax
+.skip_s4_done:
 
-    ; Debug: print "<" after block 9256 executes
+    ; Debug: print "<" after block 9256 executes (effectively disabled - compares to 999999999)
     cmp r12, 999999999
     jne .skip_after_call_debug
     push rax
@@ -7988,19 +11461,23 @@ execute_blocks:
     jne .handle_ecall
 
     ; Not an ECALL - try to link this block for future speedup
-    ; DISABLED: Block linking has a bug - blocks jump to wrong targets
-    ; TODO: Fix the linking bug (0x5A9B4 links to 0x63FDA instead of 0x63F60)
-    jmp .exec_loop
-
-    ; Only link blocks with EXIT_JUMP (direct unconditional jump)
+    ; Only link EXIT_JUMP (unconditional direct jumps like JAL)
+    ; Branches have TWO exits and need special handling (not yet implemented)
     mov rax, [rbp-48]
     mov ecx, [rax + BLOCK_EXIT_TYPE]
     cmp ecx, EXIT_JUMP
-    jne .exec_loop              ; Indirect/branch - don't link
+    jne .exec_loop              ; Only link unconditional jumps
+
+    ; BUG FIX: Only link if current PC matches block's intended target
+    ; This prevents re-linking when we follow a linked JMP through multiple blocks
+    ; (linked blocks skip the trampoline, so [rbp-48] becomes stale)
+    mov rdx, [rax + BLOCK_NEXT_PC]  ; Block's intended target from translation
+    mov rcx, [rbp-32]
+    mov rdi, [rcx]                  ; Current rv_pc value
+    cmp rdx, rdi                    ; Do they match?
+    jne .exec_loop                  ; No match = we're in a chain, don't re-link
 
     ; Look up target block by current PC
-    mov rcx, [rbp-32]
-    mov rdi, [rcx]
     call lookup_block
     test rax, rax
     jz .exec_loop               ; Target not cached yet - can't link
@@ -8013,7 +11490,8 @@ execute_blocks:
     jmp .exec_loop
 
 .handle_ecall:
-    ; Debug: print EC: marker to confirm we reached ecall handler
+    ; Debug: print EC: marker to confirm we reached ecall handler (DISABLED)
+    jmp .skip_ec_debug
     push rax
     sub rsp, 48
     mov byte [num_buffer], 'E'
@@ -8028,6 +11506,7 @@ execute_blocks:
     call WriteFile
     add rsp, 48
     pop rax
+.skip_ec_debug:
     ; ECALL - Linux RISC-V syscall ABI
     ; a7 (x17) = syscall number
     ; a0-a5 (x10-x15) = arguments
@@ -8037,13 +11516,14 @@ execute_blocks:
     ; Get syscall number from a7 (x17)
     mov rax, [rbx + 17*8]
 
-    ; Debug: Print all syscalls (set to 0 to disable)
+    ; Debug: Print all syscalls (ENABLED - print last syscall before hang)
     push rax
     inc qword [syscall_count]
     ; Print first N syscalls (0 = disable, or set high to print all)
-    ; jmp .skip_syscall_print  ; DISABLED to debug
+    ; jmp .skip_syscall_print  ; DISABLED
+    ; Print all syscalls (no limit)
     mov rcx, [syscall_count]
-    cmp rcx, 50
+    cmp rcx, 99999999
     ja .skip_syscall_print
     ; Print syscall number as hex digit
     push rax
@@ -8170,9 +11650,839 @@ execute_blocks:
 ; a0 = exit code
 ;------------------------------------------------------------------------------
 .syscall_exit:
+    mov edi, [rbx + 10*8]       ; a0 = exit code
+
+    ; DEBUG: Print exit code
+    push rdi
+    sub rsp, 48
+    mov byte [num_buffer], 'X'
+    mov byte [num_buffer+1], ':'
+    mov eax, edi
+    ; Print as 2-digit hex
+    mov ecx, eax
+    shr ecx, 4
+    and ecx, 0xF
+    cmp cl, 10
+    jb .exit_d1
+    add cl, 'A' - 10
+    jmp .exit_s1
+.exit_d1:
+    add cl, '0'
+.exit_s1:
+    mov [num_buffer+2], cl
+    mov ecx, eax
+    and ecx, 0xF
+    cmp cl, 10
+    jb .exit_d2
+    add cl, 'A' - 10
+    jmp .exit_s2
+.exit_d2:
+    add cl, '0'
+.exit_s2:
+    mov [num_buffer+3], cl
+    mov byte [num_buffer+4], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 5
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop rdi
+    ; END DEBUG
+
+    ; Print load/store counts before exit
+    push rdi
+    sub rsp, 48
+    ; Print "LB:XXXX " for LBU count
+    mov byte [num_buffer], 'L'
+    mov byte [num_buffer+1], 'B'
+    mov byte [num_buffer+2], ':'
+    mov rax, [lbu_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+6]
+.lbu_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .lbu_d
+    add dl, 'A' - 10
+    jmp .lbu_s
+.lbu_d:
+    add dl, '0'
+.lbu_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .lbu_hex
+    mov byte [num_buffer+7], ' '
+    ; Print first LBU address (8 hex digits)
+    mov byte [num_buffer+8], 'A'
+    mov byte [num_buffer+9], ':'
+    mov rax, [first_lbu_addr]
+    mov ecx, 8
+    lea rsi, [num_buffer+17]
+.lbua_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .lbua_d
+    add dl, 'A' - 10
+    jmp .lbua_s
+.lbua_d:
+    add dl, '0'
+.lbua_s:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .lbua_hex
+    mov byte [num_buffer+18], ' '
+    ; Print first LBU value (2 hex digits)
+    mov byte [num_buffer+19], 'V'
+    mov byte [num_buffer+20], ':'
+    movzx eax, byte [first_lbu_val]
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .lbuv_d1
+    add dl, 'A' - 10
+    jmp .lbuv_s1
+.lbuv_d1:
+    add dl, '0'
+.lbuv_s1:
+    mov [num_buffer+21], dl
+    and al, 0xF
+    cmp al, 10
+    jb .lbuv_d2
+    add al, 'A' - 10
+    jmp .lbuv_s2
+.lbuv_d2:
+    add al, '0'
+.lbuv_s2:
+    mov [num_buffer+22], al
+    mov byte [num_buffer+23], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 24
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    ; Print "ST:SB=XXXX SH=XXXX SW=XXXX SD=XXXX\n"
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'T'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 'B'
+    mov byte [num_buffer+4], '='
+    ; Print sb_count (4 hex digits)
+    mov rax, [sb_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+8]
+.sb_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sb_d
+    add dl, 'A' - 10
+    jmp .sb_s
+.sb_d:
+    add dl, '0'
+.sb_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .sb_hex
+
+    mov byte [num_buffer+9], ' '
+    mov byte [num_buffer+10], 'H'
+    mov byte [num_buffer+11], '='
+    mov rax, [sh_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+15]
+.sh_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sh_d
+    add dl, 'A' - 10
+    jmp .sh_s
+.sh_d:
+    add dl, '0'
+.sh_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .sh_hex
+
+    mov byte [num_buffer+16], ' '
+    mov byte [num_buffer+17], 'W'
+    mov byte [num_buffer+18], '='
+    mov rax, [sw_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+22]
+.sw_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sw_d
+    add dl, 'A' - 10
+    jmp .sw_s
+.sw_d:
+    add dl, '0'
+.sw_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .sw_hex
+
+    mov byte [num_buffer+23], ' '
+    mov byte [num_buffer+24], 'D'
+    mov byte [num_buffer+25], '='
+    mov rax, [sd_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+29]
+.sd_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sd_d
+    add dl, 'A' - 10
+    jmp .sd_s
+.sd_d:
+    add dl, '0'
+.sd_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .sd_hex
+
+    mov byte [num_buffer+30], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 31
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Print compressed store counts
+    mov byte [num_buffer], 'C'
+    mov byte [num_buffer+1], 'S'
+    mov byte [num_buffer+2], ':'
+    mov byte [num_buffer+3], 'W'
+    mov byte [num_buffer+4], '='
+    mov rax, [c_sw_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+8]
+.csw_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .csw_d
+    add dl, 'A' - 10
+    jmp .csw_s
+.csw_d:
+    add dl, '0'
+.csw_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .csw_hex
+
+    mov byte [num_buffer+9], ' '
+    mov byte [num_buffer+10], 'D'
+    mov byte [num_buffer+11], '='
+    mov rax, [c_sd_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+15]
+.csd_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .csd_d
+    add dl, 'A' - 10
+    jmp .csd_s
+.csd_d:
+    add dl, '0'
+.csd_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .csd_hex
+
+    mov byte [num_buffer+16], ' '
+    mov byte [num_buffer+17], 'S'
+    mov byte [num_buffer+18], 'W'
+    mov byte [num_buffer+19], 'S'
+    mov byte [num_buffer+20], 'P'
+    mov byte [num_buffer+21], '='
+    mov rax, [c_swsp_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+25]
+.cswsp_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .cswsp_d
+    add dl, 'A' - 10
+    jmp .cswsp_s
+.cswsp_d:
+    add dl, '0'
+.cswsp_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .cswsp_hex
+
+    mov byte [num_buffer+26], ' '
+    mov byte [num_buffer+27], 'S'
+    mov byte [num_buffer+28], 'D'
+    mov byte [num_buffer+29], 'S'
+    mov byte [num_buffer+30], 'P'
+    mov byte [num_buffer+31], '='
+    mov rax, [c_sdsp_count]
+    mov ecx, 4
+    lea rsi, [num_buffer+35]
+.csdsp_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .csdsp_d
+    add dl, 'A' - 10
+    jmp .csdsp_s
+.csdsp_d:
+    add dl, '0'
+.csdsp_s:
+    mov [rsi], dl
+    dec rsi
+    shr eax, 4
+    dec ecx
+    jnz .csdsp_hex
+
+    mov byte [num_buffer+36], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 37
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Print SB runtime execution count
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'B'
+    mov byte [num_buffer+2], 'X'
+    mov byte [num_buffer+3], '='
+    mov rax, [sb_exec_count]
+    mov ecx, 8
+    lea rsi, [num_buffer+11]
+.sbx_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sbx_d
+    add dl, 'A' - 10
+    jmp .sbx_s
+.sbx_d:
+    add dl, '0'
+.sbx_s:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .sbx_hex
+    mov byte [num_buffer+12], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 13
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Print first SB store debug info
+    ; Format: "1SB:R14=XXXXXXXXXXXXXXXX A=XXXXXXXXXXXXXXXX\n"
+    mov byte [num_buffer], '1'
+    mov byte [num_buffer+1], 'S'
+    mov byte [num_buffer+2], 'B'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], 'R'
+    mov byte [num_buffer+5], '='
+    ; Print first_sb_r14
+    mov rax, [first_sb_r14]
+    mov ecx, 16
+    lea rsi, [num_buffer+21]
+.fsr_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .fsr_d
+    add dl, 'A' - 10
+    jmp .fsr_s
+.fsr_d:
+    add dl, '0'
+.fsr_s:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .fsr_hex
+    mov byte [num_buffer+22], ' '
+    mov byte [num_buffer+23], 'A'
+    mov byte [num_buffer+24], '='
+    ; Print first_sb_addr
+    mov rax, [first_sb_addr]
+    mov ecx, 16
+    lea rsi, [num_buffer+40]
+.fsa_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .fsa_d
+    add dl, 'A' - 10
+    jmp .fsa_s
+.fsa_d:
+    add dl, '0'
+.fsa_s:
+    mov [rsi], dl
+    dec rsi
+    shr rax, 4
+    dec ecx
+    jnz .fsa_hex
+    ; Also print what's actually at that address in memory
+    ; First compute host address = [rbp-16] + first_sb_addr
+    mov rax, [rbp-16]           ; guest_memory base
+    add rax, [first_sb_addr]    ; + guest address = host address
+    movzx edx, byte [rax]       ; read back what's there
+    mov byte [num_buffer+41], ' '
+    mov byte [num_buffer+42], 'V'
+    mov byte [num_buffer+43], '='
+    ; Print as 2 hex digits
+    mov eax, edx
+    shr eax, 4
+    cmp al, 10
+    jb .fsv_d1
+    add al, 'A' - 10
+    jmp .fsv_s1
+.fsv_d1:
+    add al, '0'
+.fsv_s1:
+    mov [num_buffer+44], al
+    and dl, 0xF
+    cmp dl, 10
+    jb .fsv_d2
+    add dl, 'A' - 10
+    jmp .fsv_s2
+.fsv_d2:
+    add dl, '0'
+.fsv_s2:
+    mov [num_buffer+45], dl
+    ; Add C= for captured cl value
+    mov byte [num_buffer+46], ' '
+    mov byte [num_buffer+47], 'C'
+    mov byte [num_buffer+48], '='
+    ; Print first_sb_val as 2 hex digits
+    movzx eax, byte [first_sb_val]
+    mov edx, eax
+    shr eax, 4
+    cmp al, 10
+    jb .fsc_d1
+    add al, 'A' - 10
+    jmp .fsc_s1
+.fsc_d1:
+    add al, '0'
+.fsc_s1:
+    mov [num_buffer+49], al
+    and dl, 0xF
+    cmp dl, 10
+    jb .fsc_d2
+    add dl, 'A' - 10
+    jmp .fsc_s2
+.fsc_d2:
+    add dl, '0'
+.fsc_s2:
+    mov [num_buffer+50], dl
+    ; Add R= for readback value (immediately after store)
+    mov byte [num_buffer+51], ' '
+    mov byte [num_buffer+52], 'R'
+    mov byte [num_buffer+53], '='
+    ; Print first_sb_readback as 2 hex digits
+    movzx eax, byte [first_sb_readback]
+    mov edx, eax
+    shr eax, 4
+    cmp al, 10
+    jb .fsr2_d1
+    add al, 'A' - 10
+    jmp .fsr2_s1
+.fsr2_d1:
+    add al, '0'
+.fsr2_s1:
+    mov [num_buffer+54], al
+    and dl, 0xF
+    cmp dl, 10
+    jb .fsr2_d2
+    add dl, 'A' - 10
+    jmp .fsr2_s2
+.fsr2_d2:
+    add dl, '0'
+.fsr2_s2:
+    mov [num_buffer+55], dl
+    mov byte [num_buffer+56], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 57
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Print sb_target info: "ST@:XX\n" (what was stored at 0x6FFA4F)
+    cmp byte [sb_target_captured], 0
+    je .skip_target_print
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'T'
+    mov byte [num_buffer+2], '@'
+    mov byte [num_buffer+3], ':'
+    movzx eax, byte [sb_target_val]
+    mov edx, eax
+    shr eax, 4
+    cmp al, 10
+    jb .st_pr_d1
+    add al, 'A' - 10
+    jmp .st_pr_s1
+.st_pr_d1:
+    add al, '0'
+.st_pr_s1:
+    mov [num_buffer+4], al
+    and dl, 0xF
+    cmp dl, 10
+    jb .st_pr_d2
+    add dl, 'A' - 10
+    jmp .st_pr_s2
+.st_pr_d2:
+    add dl, '0'
+.st_pr_s2:
+    mov [num_buffer+5], dl
+    mov byte [num_buffer+6], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 7
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    jmp .after_target_print
+.skip_target_print:
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'T'
+    mov byte [num_buffer+2], '@'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], 'n'
+    mov byte [num_buffer+5], 'o'
+    mov byte [num_buffer+6], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 7
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+.after_target_print:
+
+    ; Print SW corruption info: "SWC:ADDR/STORED/READBACK\n" or "SWC:no\n"
+    cmp byte [sw_corrupt_captured], 0
+    je .skip_swc_print
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'W'
+    mov byte [num_buffer+2], 'C'
+    mov byte [num_buffer+3], ':'
+    ; Print address (8 hex digits)
+    mov eax, [sw_corrupt_addr]
+    lea rdi, [num_buffer+4]
+    mov ecx, 8
+.swc_hex_addr:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .swc_digit_a
+    add dl, 'A' - 10
+    jmp .swc_store_a
+.swc_digit_a:
+    add dl, '0'
+.swc_store_a:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .swc_hex_addr
+    mov byte [rdi], '/'
+    inc rdi
+    ; Print stored value (8 hex digits)
+    mov eax, [sw_corrupt_stored]
+    mov ecx, 8
+.swc_hex_stored:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .swc_digit_s
+    add dl, 'A' - 10
+    jmp .swc_store_s
+.swc_digit_s:
+    add dl, '0'
+.swc_store_s:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .swc_hex_stored
+    mov byte [rdi], '/'
+    inc rdi
+    ; Print readback value (8 hex digits)
+    mov eax, [sw_corrupt_readback]
+    mov ecx, 8
+.swc_hex_readback:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .swc_digit_r
+    add dl, 'A' - 10
+    jmp .swc_store_r
+.swc_digit_r:
+    add dl, '0'
+.swc_store_r:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .swc_hex_readback
+    mov byte [rdi], 10
+    inc rdi
+    ; Write it all
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8, rdi
+    sub r8, rdx
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    jmp .after_swc_print
+.skip_swc_print:
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'W'
+    mov byte [num_buffer+2], 'C'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], 'n'
+    mov byte [num_buffer+5], 'o'
+    mov byte [num_buffer+6], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 7
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+.after_swc_print:
+
+    ; Print SD corruption info: "SDC:ADDR/STORED_LO/READBACK_LO\n" or "SDC:no\n"
+    cmp byte [sd_corrupt_captured], 0
+    je .skip_sdc_print
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'D'
+    mov byte [num_buffer+2], 'C'
+    mov byte [num_buffer+3], ':'
+    ; Print address (8 hex digits)
+    mov eax, [sd_corrupt_addr]
+    lea rdi, [num_buffer+4]
+    mov ecx, 8
+.sdc_hex_addr:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sdc_digit_a
+    add dl, 'A' - 10
+    jmp .sdc_store_a
+.sdc_digit_a:
+    add dl, '0'
+.sdc_store_a:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .sdc_hex_addr
+    mov byte [rdi], '/'
+    inc rdi
+    ; Print stored value low 32 bits (8 hex digits)
+    mov eax, [sd_corrupt_stored]
+    mov ecx, 8
+.sdc_hex_stored:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sdc_digit_s
+    add dl, 'A' - 10
+    jmp .sdc_store_s
+.sdc_digit_s:
+    add dl, '0'
+.sdc_store_s:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .sdc_hex_stored
+    mov byte [rdi], '/'
+    inc rdi
+    ; Print readback value low 32 bits (8 hex digits)
+    mov eax, [sd_corrupt_readback]
+    mov ecx, 8
+.sdc_hex_readback:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .sdc_digit_r
+    add dl, 'A' - 10
+    jmp .sdc_store_r
+.sdc_digit_r:
+    add dl, '0'
+.sdc_store_r:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .sdc_hex_readback
+    mov byte [rdi], 10
+    inc rdi
+    ; Write it all
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8, rdi
+    sub r8, rdx
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    jmp .after_sdc_print
+.skip_sdc_print:
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], 'D'
+    mov byte [num_buffer+2], 'C'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], 'n'
+    mov byte [num_buffer+5], 'o'
+    mov byte [num_buffer+6], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 7
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+.after_sdc_print:
+
+    ; Print C.SW corruption info: "CSW:ADDR/STORED/READBACK\n" or "CSW:no\n"
+    cmp byte [csw_corrupt_captured], 0
+    je .skip_csw_print
+    mov byte [num_buffer], 'C'
+    mov byte [num_buffer+1], 'S'
+    mov byte [num_buffer+2], 'W'
+    mov byte [num_buffer+3], ':'
+    ; Print address (8 hex digits)
+    mov eax, [csw_corrupt_addr]
+    lea rdi, [num_buffer+4]
+    mov ecx, 8
+.csw_hex_addr:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .csw_digit_a
+    add dl, 'A' - 10
+    jmp .csw_store_a
+.csw_digit_a:
+    add dl, '0'
+.csw_store_a:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .csw_hex_addr
+    mov byte [rdi], '/'
+    inc rdi
+    ; Print stored value (8 hex digits)
+    mov eax, [csw_corrupt_stored]
+    mov ecx, 8
+.csw_hex_stored:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .csw_digit_s
+    add dl, 'A' - 10
+    jmp .csw_store_s
+.csw_digit_s:
+    add dl, '0'
+.csw_store_s:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .csw_hex_stored
+    mov byte [rdi], '/'
+    inc rdi
+    ; Print readback value (8 hex digits)
+    mov eax, [csw_corrupt_readback]
+    mov ecx, 8
+.csw_hex_readback:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .csw_digit_r
+    add dl, 'A' - 10
+    jmp .csw_store_r
+.csw_digit_r:
+    add dl, '0'
+.csw_store_r:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .csw_hex_readback
+    mov byte [rdi], 10
+    inc rdi
+    ; Write it all
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8, rdi
+    sub r8, rdx
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    jmp .after_csw_print
+.skip_csw_print:
+    mov byte [num_buffer], 'C'
+    mov byte [num_buffer+1], 'S'
+    mov byte [num_buffer+2], 'W'
+    mov byte [num_buffer+3], ':'
+    mov byte [num_buffer+4], 'n'
+    mov byte [num_buffer+5], 'o'
+    mov byte [num_buffer+6], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 7
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+.after_csw_print:
+
+    add rsp, 48
+    pop rdi
+    ; END store count debug
+
+%ifdef WINDOWS
     sub rsp, 40
-    mov ecx, [rbx + 10*8]       ; a0 = exit code
+    mov ecx, edi
     call ExitProcess
+%else
+    ; Linux: syscall exit(status)
+    mov eax, 60                 ; SYS_exit
+    syscall
+%endif
 
 ;------------------------------------------------------------------------------
 ; read(fd, buf, count) - syscall 63
@@ -8321,7 +12631,8 @@ execute_blocks:
     jmp .exec_loop
 
 .write_stdout:
-    ; Simple debug marker
+    ; Simple debug marker (DISABLED for perf)
+    jmp .skip_write_marker
     push rax
     sub rsp, 48
     mov byte [num_buffer], 'W'
@@ -8335,11 +12646,13 @@ execute_blocks:
     add rsp, 48
     pop rax
 
+.skip_write_marker:
     ; Get buffer address (guest) and count
     mov rsi, [rbx + 11*8]       ; a1 = buf (guest offset)
     mov r8, [rbx + 12*8]        ; a2 = count (use r8 for Windows call)
 
-    ; Debug: print buffer address for first 5 writes
+    ; Debug: print buffer address for first 5 writes (DISABLED for perf)
+    jmp .skip_buf_debug_no_pop
     push rax
     mov rax, [syscall_count]
     cmp rax, 5
@@ -8405,6 +12718,7 @@ execute_blocks:
     pop rsi                     ; Restore buffer address
 .skip_buf_debug:
     pop rax
+.skip_buf_debug_no_pop:
 
     ; Convert guest address to host address
     mov rdi, [rbp-16]           ; guest memory base
@@ -8416,6 +12730,51 @@ execute_blocks:
     ; Debug: skip if count is 0
     test r8, r8
     jz .write_zero
+
+    ; DEBUG: Check if writing single byte 'C' (0x43) to trace the corruption
+    cmp r8, 1                   ; Single byte write?
+    jne .skip_c_debug
+    cmp byte [rsi], 0x43        ; Writing 'C'?
+    jne .skip_c_debug
+    ; Print "!C:XXXXXXXX\n" showing guest address where 'C' came from
+    push rax
+    push rsi
+    push r8
+    sub rsp, 48
+    mov byte [num_buffer], '!'
+    mov byte [num_buffer+1], 'C'
+    mov byte [num_buffer+2], ':'
+    ; Guest address = rsi - rdi = [rbx + 11*8]
+    mov eax, [rbx + 11*8]       ; Guest buffer address
+    mov edi, 8
+    lea rcx, [num_buffer+3]
+.c_hex:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .c_digit
+    add dl, 'A' - 10
+    jmp .c_store
+.c_digit:
+    add dl, '0'
+.c_store:
+    mov [rcx], dl
+    inc rcx
+    dec edi
+    jnz .c_hex
+    mov byte [num_buffer+11], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 12
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    add rsp, 48
+    pop r8
+    pop rsi
+    pop rax
+.skip_c_debug:
 
     ; Save rbx and count across Windows call
     push rbx
@@ -8936,47 +13295,404 @@ execute_blocks:
 ;------------------------------------------------------------------------------
 .syscall_openat:
     push rbx
-    sub rsp, 80                     ; Shadow space + locals
+    sub rsp, 88                     ; Shadow space + locals (88 for alignment)
 
-    ; Get pathname from guest memory
+    ; Clear path_buffer first to detect if copy works
+    mov rdi, [path_buffer_ptr]
+    mov byte [rdi], 'X'             ; Mark with X to detect if copy fails
+    mov byte [rdi+1], 'X'
+    mov byte [rdi+2], 'X'
+    mov byte [rdi+3], 0
+
+    ; Test: can we read [rbp-16] without crashing?
+    mov rax, [rbp-16]               ; This should be guest memory base
+    test rax, rax                   ; Is it zero?
+    jz .openat_test_fail
+
+    ; Test: can we read [rbx + 11*8] without crashing?
+    mov rax, [rbx + 11*8]           ; This should be a1 pathname pointer
+    ; If we get here, both reads worked
+
+    ; Debug: print return address (ra = x1) to see caller
+    ; Print "RA:XXXXXXXX " (8 hex digits)
+    mov byte [num_buffer], 'R'
+    mov byte [num_buffer+1], 'A'
+    mov byte [num_buffer+2], ':'
+    mov rax, [rbx + 1*8]        ; ra = x1
+    mov ecx, 8
+    lea r10, [num_buffer+10]
+.ra_oat_loop:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .ra_oat_d
+    add dl, 'A' - 10
+    jmp .ra_oat_s
+.ra_oat_d:
+    add dl, '0'
+.ra_oat_s:
+    mov [r10], dl
+    dec r10
+    shr rax, 4
+    dec ecx
+    jnz .ra_oat_loop
+    mov byte [num_buffer+11], ' '
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 12
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Debug: print 'Y' to show we passed tests
+    mov byte [num_buffer], 'Y'
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Debug: print guest memory base [rbp-16] as hex
+    mov byte [num_buffer], 'B'
+    mov byte [num_buffer+1], ':'
+    mov rax, [rbp-16]
+    mov ecx, 8
+    lea r10, [num_buffer+9]
+.gbase_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .gbase_dig
+    add dl, 'A' - 10
+    jmp .gbase_st
+.gbase_dig:
+    add dl, '0'
+.gbase_st:
+    mov [r10], dl
+    dec r10
+    shr rax, 4
+    dec ecx
+    jnz .gbase_hex
+    mov byte [num_buffer+10], ' '
+    ; Also print a1 value
+    mov byte [num_buffer+11], 'A'
+    mov byte [num_buffer+12], ':'
+    mov rax, [rbx + 11*8]
+    mov ecx, 8
+    lea r10, [num_buffer+20]
+.a1_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .a1_dig
+    add dl, 'A' - 10
+    jmp .a1_st
+.a1_dig:
+    add dl, '0'
+.a1_st:
+    mov [r10], dl
+    dec r10
+    shr rax, 4
+    dec ecx
+    jnz .a1_hex
+    mov byte [num_buffer+21], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 22
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Get pathname from guest memory (reload since WriteFile clobbered registers)
     mov rdi, [rbp-16]               ; guest memory base
     mov rax, [rbx + 11*8]           ; a1 = pathname (guest addr)
     add rdi, rax                    ; RDI = host addr of pathname
 
-    ; Copy pathname to buffer (null-terminated)
-    lea rsi, [path_buffer]
+    ; Save rdi to global variable (stack is unreliable due to complex call sequences)
+    mov [openat_src_addr], rdi
+
+    ; Debug: print 'Z' before copy (with rdi saved)
+    mov byte [num_buffer], 'Z'
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    mov rdi, [openat_src_addr]      ; Restore rdi from global
+
+    ; Debug: print rdi value as 8 hex digits
+    push rdi
+    mov rax, rdi
+    mov byte [num_buffer], 'P'
+    mov byte [num_buffer+1], ':'
+    ; Print 8 nibbles
+    mov ecx, 8
+    lea r10, [num_buffer+9]
+.prdi_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .prdi_dig
+    add dl, 'A' - 10
+    jmp .prdi_st
+.prdi_dig:
+    add dl, '0'
+.prdi_st:
+    mov [r10], dl
+    dec r10
+    shr rax, 4
+    dec ecx
+    jnz .prdi_hex
+    mov byte [num_buffer+10], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 11
+    lea r9, [stdout_written]
+    mov qword [rsp+40], 0
+    call WriteFile
+    pop rdi
+
+    ; Debug: print first 4 bytes at source address as hex
+    mov byte [num_buffer], 'S'
+    mov byte [num_buffer+1], ':'
+    ; Byte 0
+    movzx eax, byte [rdi]
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .sb0h
+    add dl, 'A'-10
+    jmp .sb0hs
+.sb0h:
+    add dl, '0'
+.sb0hs:
+    mov [num_buffer+2], dl
+    and al, 0xF
+    cmp al, 10
+    jb .sb0l
+    add al, 'A'-10
+    jmp .sb0ls
+.sb0l:
+    add al, '0'
+.sb0ls:
+    mov [num_buffer+3], al
+    mov byte [num_buffer+4], ' '
+    ; Byte 1
+    movzx eax, byte [rdi+1]
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .sb1h
+    add dl, 'A'-10
+    jmp .sb1hs
+.sb1h:
+    add dl, '0'
+.sb1hs:
+    mov [num_buffer+5], dl
+    and al, 0xF
+    cmp al, 10
+    jb .sb1l
+    add al, 'A'-10
+    jmp .sb1ls
+.sb1l:
+    add al, '0'
+.sb1ls:
+    mov [num_buffer+6], al
+    mov byte [num_buffer+7], ' '
+    ; Byte 2
+    movzx eax, byte [rdi+2]
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .sb2h
+    add dl, 'A'-10
+    jmp .sb2hs
+.sb2h:
+    add dl, '0'
+.sb2hs:
+    mov [num_buffer+8], dl
+    and al, 0xF
+    cmp al, 10
+    jb .sb2l
+    add al, 'A'-10
+    jmp .sb2ls
+.sb2l:
+    add al, '0'
+.sb2ls:
+    mov [num_buffer+9], al
+    mov byte [num_buffer+10], ' '
+    ; Byte 3
+    movzx eax, byte [rdi+3]
+    mov edx, eax
+    shr edx, 4
+    cmp dl, 10
+    jb .sb3h
+    add dl, 'A'-10
+    jmp .sb3hs
+.sb3h:
+    add dl, '0'
+.sb3hs:
+    mov [num_buffer+11], dl
+    and al, 0xF
+    cmp al, 10
+    jb .sb3l
+    add al, 'A'-10
+    jmp .sb3ls
+.sb3l:
+    add al, '0'
+.sb3ls:
+    mov [num_buffer+12], al
+    mov byte [num_buffer+13], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 14
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Reload rdi from global
+    mov rdi, [openat_src_addr]
+
+    ; Debug: print rdi value before copy
+    mov rax, rdi
+    mov byte [num_buffer], 'R'
+    mov byte [num_buffer+1], ':'
+    mov ecx, 16
+    lea r10, [num_buffer+17]
+.rdi_final_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .rdi_fd
+    add dl, 'A'-10
+    jmp .rdi_fs
+.rdi_fd:
+    add dl, '0'
+.rdi_fs:
+    mov [r10], dl
+    dec r10
+    shr rax, 4
+    dec ecx
+    jnz .rdi_final_hex
+    mov byte [num_buffer+18], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 19
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+
+    ; Recompute rdi fresh from registers (test if openat_src_addr is corrupted)
+    mov rdi, [rbp-16]               ; guest memory base
+    add rdi, [rbx + 11*8]           ; + a1 pathname guest addr
+
+    ; Debug: print fresh computed address
+    mov rax, rdi
+    mov byte [num_buffer], 'F'
+    mov byte [num_buffer+1], ':'
+    mov ecx, 16
+    lea r10, [num_buffer+17]
+.fresh_hex:
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .fresh_d
+    add dl, 'A'-10
+    jmp .fresh_s
+.fresh_d:
+    add dl, '0'
+.fresh_s:
+    mov [r10], dl
+    dec r10
+    shr rax, 4
+    dec ecx
+    jnz .fresh_hex
+    mov byte [num_buffer+18], 10
+    push rdi
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 19
+    lea r9, [stdout_written]
+    mov qword [rsp+40], 0
+    call WriteFile
+    pop rdi
+
+    mov rsi, [path_buffer_ptr]      ; Dest buffer (from global ptr)
     mov ecx, 259
+    jmp .copy_path
+
+.openat_test_fail:
+    mov byte [num_buffer], 'F'
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
+    jmp .openat_enoent
+
 .copy_path:
     mov al, [rdi]
+    cmp al, '/'             ; Convert Unix path separators
+    jne .no_slash_convert
+    mov al, '\'
+.no_slash_convert:
     mov [rsi], al
     test al, al
-    jz .path_done
+    jz .path_done_clean
     inc rdi
     inc rsi
     dec ecx
     jnz .copy_path
     mov byte [rsi], 0
-.path_done:
 
-    ; Debug: print path being opened
+.path_done_clean:
+    ; Skip leading ".\" if present (current directory prefix)
+    mov rsi, [path_buffer_ptr]
+    cmp byte [rsi], '.'
+    jne .path_ready
+    cmp byte [rsi+1], '\'
+    jne .path_ready
+    add rsi, 2              ; Skip ".\"
+    mov rdi, [path_buffer_ptr]
+.shift_path:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .path_ready
+    inc rsi
+    inc rdi
+    jmp .shift_path
+.path_ready:
+    ; Debug: print the path string
     push rbx
-    sub rsp, 48
     mov rcx, [stdout_handle]
-    lea rdx, [path_buffer]
-    ; Get string length
+    mov rdx, [path_buffer_ptr]
+    ; Calculate string length (max 60)
     xor r8d, r8d
-    lea r11, [path_buffer]
-.path_len:
-    cmp byte [r11 + r8], 0
+    mov rax, rdx
+.path_len_loop:
+    cmp byte [rax], 0
     je .path_len_done
     inc r8d
-    cmp r8d, 250
-    jb .path_len
+    inc rax
+    cmp r8d, 60
+    jb .path_len_loop
 .path_len_done:
-    lea r9, [bytes_written]
+    lea r9, [stdout_written]
     mov qword [rsp+32], 0
     call WriteFile
-    add rsp, 48
+    ; Print newline
+    mov byte [num_buffer], 10
+    mov rcx, [stdout_handle]
+    lea rdx, [num_buffer]
+    mov r8d, 1
+    lea r9, [stdout_written]
+    mov qword [rsp+32], 0
+    call WriteFile
     pop rbx
 
     ; Find a free slot in file table
@@ -8995,6 +13711,10 @@ execute_blocks:
     push rax                        ; Save slot index
     push r10                        ; Save file table base
 
+    ; Check Linux flags from a2 (x12) to determine access mode
+    mov rax, [rbx + 12*8]           ; Get flags from a2
+    mov r11, rax                    ; Save flags for later
+
     ; Call CreateFileA
     ; RCX = lpFileName
     ; RDX = dwDesiredAccess
@@ -9003,13 +13723,39 @@ execute_blocks:
     ; [rsp+32] = dwCreationDisposition
     ; [rsp+40] = dwFlagsAndAttributes
     ; [rsp+48] = hTemplateFile
-    lea rcx, [path_buffer]
+    mov rcx, [path_buffer_ptr]
+
+    ; Determine access mode based on O_RDONLY(0), O_WRONLY(1), O_RDWR(2)
+    mov edx, GENERIC_READ           ; Default: read
+    test r11d, 3                    ; Check access bits
+    jz .openat_access_done          ; O_RDONLY = 0
+    test r11d, 1
+    jz .openat_rdwr
+    mov edx, GENERIC_WRITE          ; O_WRONLY = 1
+    jmp .openat_access_done
+.openat_rdwr:
     mov edx, GENERIC_READ
+    or edx, GENERIC_WRITE           ; O_RDWR = 2
+
+.openat_access_done:
     mov r8d, FILE_SHARE_READ
+    or r8d, FILE_SHARE_WRITE        ; Allow sharing
     xor r9d, r9d
-    mov qword [rsp+48], OPEN_EXISTING
-    mov qword [rsp+56], FILE_ATTRIBUTE_NORMAL
-    mov qword [rsp+64], 0
+
+    ; Determine creation disposition based on O_CREAT (0x40), O_TRUNC (0x200)
+    mov eax, OPEN_EXISTING          ; Default
+    test r11d, 0x40                 ; O_CREAT?
+    jz .openat_disp_done
+    test r11d, 0x200                ; O_TRUNC?
+    jz .openat_create_new
+    mov eax, CREATE_ALWAYS          ; O_CREAT | O_TRUNC
+    jmp .openat_disp_done
+.openat_create_new:
+    mov eax, OPEN_ALWAYS            ; O_CREAT without O_TRUNC
+.openat_disp_done:
+    mov qword [rsp+32], rax                     ; dwCreationDisposition
+    mov qword [rsp+40], FILE_ATTRIBUTE_NORMAL   ; dwFlagsAndAttributes
+    mov qword [rsp+48], 0                       ; hTemplateFile
     call CreateFileA
 
     pop r10                         ; Restore file table base
@@ -9022,19 +13768,19 @@ execute_blocks:
 
     ; Return fd = slot + FD_OFFSET
     add ecx, FD_OFFSET
-    add rsp, 80
+    add rsp, 88
     pop rbx
     mov [rbx + 10*8], rcx
     jmp .exec_loop
 
 .openat_emfile:
-    add rsp, 80
+    add rsp, 88
     pop rbx
     mov qword [rbx + 10*8], -24     ; -EMFILE (too many open files)
     jmp .exec_loop
 
 .openat_enoent:
-    add rsp, 80
+    add rsp, 88
     pop rbx
     mov qword [rbx + 10*8], -2      ; -ENOENT
     jmp .exec_loop
@@ -9211,7 +13957,7 @@ execute_blocks:
     push r13
     sub rsp, 48
 
-    ; Print "NULL! PC history:\n"
+    ; Print "NULL a0=XXXXXXXX ra=XXXXXXXX\n"
     mov byte [num_buffer], 'N'
     mov byte [num_buffer+1], 'U'
     mov byte [num_buffer+2], 'L'
@@ -9241,12 +13987,37 @@ execute_blocks:
     dec ecx
     jnz .npc_a0_loop
 
+    ; Also print ra (x1)
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'r'
+    mov byte [rdi+2], 'a'
+    mov byte [rdi+3], '='
+    add rdi, 4
+
+    mov rax, [rbx + 1*8]            ; ra = x1
+    mov ecx, 8
+.npc_ra_loop:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xF
+    cmp dl, 10
+    jb .npc_ra_dig
+    add dl, 'A'-10
+    jmp .npc_ra_str
+.npc_ra_dig:
+    add dl, '0'
+.npc_ra_str:
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .npc_ra_loop
+
     mov byte [rdi], 13
     mov byte [rdi+1], 10
 
     mov rcx, [stdout_handle]
     lea rdx, [num_buffer]
-    mov r8d, 18
+    mov r8d, 30                     ; "NULL a0=XXXXXXXX ra=XXXXXXXX\r\n"
     lea r9, [bytes_written]
     mov qword [rsp+32], 0
     call WriteFile

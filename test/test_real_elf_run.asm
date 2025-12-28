@@ -32,6 +32,7 @@ section .bss
     elf_buffer      resb 65536
     guest_memory    resb 65536
     rv_regs         resq 32
+    rv_fp_regs      resq 32
     rv_pc           resq 1
 
 section .text
@@ -137,6 +138,16 @@ main:
     mov ecx, 8
     ; call quick_exit
 
+    ; Clear FP registers
+    lea rdi, [rv_fp_regs]
+    xor eax, eax
+    mov ecx, 32
+.clr_fp:
+    mov [rdi], rax
+    add rdi, 8
+    dec ecx
+    jnz .clr_fp
+
     ; Execute
     xor edi, edi
     lea rsi, [guest_memory]
@@ -144,6 +155,7 @@ main:
     lea rdx, [rv_regs]
     lea rcx, [rv_pc]
     mov r8d, 1000                   ; Enough blocks for larger benchmarks
+    lea r9, [rv_fp_regs]            ; FP registers
     call execute_blocks
 
     ; === CHECKPOINT 9 ===
