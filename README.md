@@ -4,20 +4,36 @@ A RISC-V to x86-64 dynamic binary translator.
 
 ## Why "Conway"?
 
-Named after Lynn Conway (1938-2024), who invented dynamic 
-instruction scheduling, the technique that makes modern 
+Named after Lynn Conway (1938-2024), who invented dynamic
+instruction scheduling, the technique that makes modern
 CPUs fast.
 
-She transitioned in 1968, rebuilt her career from scratch, 
-co-wrote the textbook that taught a generation how to design 
-chips, rode motorcycles, and spent 37 years with the love of 
+She transitioned in 1968, rebuilt her career from scratch,
+co-wrote the textbook that taught a generation how to design
+chips, rode motorcycles, and spent 37 years with the love of
 her life.
 
 She passed away at 86 having changed the world.
 
-This project is about making instructions flow between 
-architectures. She figured out how to make them flow 
+This project is about making instructions flow between
+architectures. She figured out how to make them flow
 efficiently in the first place.
+
+## Why Assembly?
+
+A reasonable question. We have an unreasonable answer.
+
+Every other binary translator project trusts the compiler. The compiler is a very sophisticated piece of software that makes very sophisticated decisions. Sometimes these decisions are "I will now spill your hot register to memory because Mercury is in retrograde" or "I have detected a loop. I will unroll it. I will not tell you how much." You cannot argue with the compiler. The compiler has a computer science degree and knows what it is doing. The compiler is lying.
+
+When you write the translator in assembly, you make all the decisions. This means when something breaks at 3am, it is your fault. This is actually better. When the compiler breaks something at 3am, it is still your fault, but you also cannot find it, because the compiler has Optimised.
+
+There is something philosophically appropriate about writing a tool that converts assembly to assembly... in assembly. We are not "cutting out the middleman." We are acknowledging that the middleman was never our friend.
+
+Also, Apple named their translator "Rosetta" and then locked it in a vault in Cupertino. We would like to remind Apple that the whole point of the Rosetta Stone was that people could *look at it*. It is in the British Museum. You can visit it. For free. On a Tuesday.
+
+Anyway.
+
+This is our stone. You are looking at it.
 
 ## Overview
 
@@ -47,7 +63,7 @@ Please look at **ROADMAP.md** for more information on future plans!
 
 ## Building
 
-Good on you for being brave! 
+Good on you for being brave!
 
 Requires NASM and a linker (ld or link.exe on Windows).
 
