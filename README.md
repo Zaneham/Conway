@@ -1,6 +1,44 @@
 # Conway
 
-A RISC-V to x86-64 dynamic binary translator.
+A RISC-V to x86-64 dynamic binary translator that passes **100% of the official RISC-V compliance tests**.
+
+## Quick Start
+
+```bash
+# Clone
+git clone https://github.com/Zaneham/Conway.git
+cd Conway
+
+# Build (Windows)
+build.bat
+
+# Build (Linux)
+make linux
+
+# Run
+./bin/conway examples/hello.elf
+```
+
+Output:
+```
+Hello from RISC-V!
+```
+
+That's a real RISC-V ELF binary running on your x86-64 machine.
+
+## Compliance
+
+Conway passes the **official RISC-V Architecture Compliance Test Suite**.
+
+| Extension | Tests | Status |
+|-----------|-------|--------|
+| **I** - Base Integer | 50 | ✅ ALL PASS |
+| **M** - Multiply/Divide | 13 | ✅ ALL PASS |
+| **A** - Atomics | 18 | ✅ ALL PASS |
+| **C** - Compressed | 33 | ✅ ALL PASS |
+| **F** - Single-precision FP | 18 | ✅ ALL PASS |
+| **D** - Double-precision FP | 27 | ✅ ALL PASS |
+| **TOTAL** | **159** | ✅ **100%** |
 
 ## Why "Conway"?
 
@@ -93,22 +131,6 @@ Test programmes live in `test/riscv/`. We've verified:
 - `fib.S` - Fibonacci(10)=55
 
 Both work. We checked twice.
-
-## Test Suite Results
-
-Conway passes the **official RISC-V Architecture Compliance Test Suite** (riscv-arch-test).
-
-| Extension | Tests | Status |
-|-----------|-------|--------|
-| **I** - Base Integer | 50 |  ALL PASS |
-| **M** - Multiply/Divide | 13 |  ALL PASS |
-| **A** - Atomics | 18 |  ALL PASS |
-| **C** - Compressed | 33 |  ALL PASS |
-| **F** - Single-precision FP | 18 |  ALL PASS |
-| **D** - Double-precision FP | 27 |  ALL PASS |
-| **TOTAL** | **159** |  **100%** |
-
-Good golly.
 
 ## Supported Instructions
 
