@@ -30,6 +30,7 @@ ET_EXEC             equ 2               ; Executable file
 ; Programme Header Types
 PT_NULL             equ 0               ; Unused entry (bit of a waste really)
 PT_LOAD             equ 1               ; Loadable segment (the interesting bit)
+PT_TLS              equ 7               ; Thread-local storage template
 
 ; ELF64 Header Offsets - Where to find the good stuff
 ELF_E_IDENT         equ 0               ; 16 bytes of identification
@@ -81,12 +82,28 @@ section .bss
     alignb 8
     elf_entry_point resq 1              ; Entry point address
     elf_load_base   resq 1              ; Base address where we loaded it
+    elf_brk_base    resq 1              ; Initial brk (end of loaded segments, page-aligned)
+    elf_tls_vaddr   resq 1              ; TLS segment virtual address
+    elf_tls_filesz  resq 1              ; TLS segment file size
+    elf_tls_memsz   resq 1              ; TLS segment memory size
+    elf_tls_offset  resq 1              ; TLS segment file offset
+    elf_tls_base    resq 1              ; Actual TLS block address (guest addr after allocation)
+    elf_phoff       resq 1              ; Program header offset (for auxv)
+    elf_phentsize   resq 1              ; Program header entry size (56 for ELF64)
+    elf_phnum       resq 1              ; Number of program headers
 
 section .text
     global load_elf
     global validate_elf_header
     global elf_entry_point
     global elf_load_base
+    global elf_brk_base
+    global get_elf_brk_base
+    global elf_tls_base
+    global elf_tls_memsz
+    global elf_phoff
+    global elf_phentsize
+    global elf_phnum
 
 ;==============================================================================
 ; validate_elf_header
@@ -196,7 +213,11 @@ load_elf:
     ; Get programme header info
     mov rax, [rdi + ELF_E_PHOFF]    ; Programme header offset
     mov [rbp-40], rax
+    mov [elf_phoff], rax            ; Save for auxv
+    movzx rax, word [rdi + ELF_E_PHENTSIZE]  ; Programme header entry size
+    mov [elf_phentsize], rax
     movzx r12, word [rdi + ELF_E_PHNUM]  ; Number of programme headers
+    mov [elf_phnum], r12
 
     ; Check we have at least one programme header
     test r12, r12
@@ -215,6 +236,9 @@ load_elf:
     ; Track lowest virtual address for load base
     mov qword [elf_load_base], 0xFFFFFFFFFFFFFFFF
 
+    ; Track highest virtual address for brk base (end of loaded segments)
+    mov qword [elf_brk_base], 0
+
     ; Iterate through programme headers
     xor ebx, ebx                ; EBX = counter
 
@@ -222,8 +246,26 @@ load_elf:
     cmp ebx, r12d
     jge .load_done
 
-    ; Check if this is a PT_LOAD segment
+    ; Check segment type
     mov eax, [r13 + PHDR_P_TYPE]
+
+    ; Check for PT_TLS segment
+    cmp eax, PT_TLS
+    jne .not_tls
+
+    ; Record TLS segment info
+    mov rax, [r13 + PHDR_P_VADDR]
+    mov [elf_tls_vaddr], rax
+    mov rax, [r13 + PHDR_P_FILESZ]
+    mov [elf_tls_filesz], rax
+    mov rax, [r13 + PHDR_P_MEMSZ]
+    mov [elf_tls_memsz], rax
+    mov rax, [r13 + PHDR_P_OFFSET]
+    mov [elf_tls_offset], rax
+    jmp .next_header
+
+.not_tls:
+    ; Check if this is a PT_LOAD segment
     cmp eax, PT_LOAD
     jne .next_header
 
@@ -242,9 +284,15 @@ load_elf:
     ; Check if segment fits in guest memory
     ; For simplicity, we load at vaddr directly (assuming small addresses)
     ; A proper loader would handle relocation, but we're not barbarians... actually, we are
-    add rax, rdx                ; vaddr + memsz
+    add rax, rdx                ; vaddr + memsz = segment end
     cmp rax, r15                ; Compare with guest memory size
     ja .too_big
+
+    ; Update brk base if this segment ends higher
+    cmp rax, [elf_brk_base]
+    jbe .skip_brk_update
+    mov [elf_brk_base], rax
+.skip_brk_update:
 
     ; Copy segment from file to guest memory
     ; Destination: guest_mem + vaddr
@@ -295,6 +343,24 @@ load_elf:
     jmp .load_loop
 
 .load_done:
+    ; Page-align brk base (round up to 4KB boundary)
+    mov rax, [elf_brk_base]
+    add rax, 0xFFF              ; Add 4095
+    and rax, ~0xFFF             ; Clear lower 12 bits
+    mov [elf_brk_base], rax
+
+    ; Initialize TLS if present
+    ; For static executables, the TLS template is already loaded at its vaddr
+    ; by a PT_LOAD segment.
+    ; Newlib uses TP pointing to start of TLS block, with positive offsets.
+    mov rax, [elf_tls_vaddr]
+    test rax, rax
+    jz .no_tls
+
+    ; TP = TLS vaddr (start of TLS block)
+    mov [elf_tls_base], rax
+
+.no_tls:
     ; Success!
     xor eax, eax
     jmp .cleanup
@@ -338,4 +404,14 @@ get_elf_entry_point:
 ;==============================================================================
 get_elf_load_base:
     mov rax, [elf_load_base]
+    ret
+
+;==============================================================================
+; get_elf_brk_base
+; Returns the initial program break (end of loaded segments, page-aligned)
+;
+; Output: RAX = initial brk address
+;==============================================================================
+get_elf_brk_base:
+    mov rax, [elf_brk_base]
     ret
