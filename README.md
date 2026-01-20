@@ -73,6 +73,14 @@ Anyway.
 
 This is our stone. You are looking at it.
 
+## Why not QEMU?
+
+QEMU is faster. QEMU supports more architectures. QEMU has actual funding and a development team and probably a logo designed by someone who went to art school.
+
+QEMU also fails compliance tests that Conway passes, but I'm sure they have their reasons.
+
+I don't know what those reasons are. I didn't ask. It felt rude.
+
 ## Overview
 
 Conway is a binary translator that dynamically converts RISC-V (RV64I) instructions to native x86-64 machine code. The translator operates at runtime, decoding RISC-V instructions and emitting equivalent x86-64 sequences.
