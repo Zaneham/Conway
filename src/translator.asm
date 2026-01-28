@@ -1320,9 +1320,9 @@ translate_instruction:
     mov byte [r12+3], 0xFF      ; -1
     add r12, 4
 
-    ; Emit: jne .do_idiv (+12 to skip overflow handling)
+    ; Emit: jne .do_idiv (+15 to skip overflow handling)
     mov byte [r12], 0x75        ; jne rel8
-    mov byte [r12+1], 15        ; skip to idiv
+    mov byte [r12+1], 15        ; skip to idiv (10+3+2 = 15 bytes)
     add r12, 2
 
     ; Check if dividend is -2^63 (0x8000000000000000)
@@ -1476,9 +1476,9 @@ translate_instruction:
     mov byte [r12+3], 0xFF      ; -1
     add r12, 4
 
-    ; Emit: jne .do_idiv (+15 to skip overflow handling)
+    ; Emit: jne .do_idiv (+20 to skip overflow handling)
     mov byte [r12], 0x75        ; jne rel8
-    mov byte [r12+1], 15        ; skip to idiv
+    mov byte [r12+1], 20        ; skip to idiv (10+3+2+3+2 = 20 bytes)
     add r12, 2
 
     ; Check if dividend is -2^63
