@@ -2,6 +2,9 @@
 *.o
 *.obj
 *.exe
+bin/
+obj/
+build/
 
 # Editor files
 *.swp
@@ -11,4 +14,36 @@
 # OS files
 .DS_Store
 Thumbs.db
+nul
+
+# Test output
+test_out.txt
+test_output.txt
+*.dis
+
+# Doom stuff (testing)
+*.wad
+doomgeneric/
+freedoom*/
+doom_*.txt
+Golink.zip
+golink_temp/
+
+# Debug assembly files in root
+/*.S
+
+# Archives
+*.zip
+
+# Linux binary
+conway_linux
+
+# ELF test binaries
+*.elf
+*.elf.backup
+
+# Misc
 benchmarks/
+benchmarks;C/
+arch-test/
+conway-arch-env/
