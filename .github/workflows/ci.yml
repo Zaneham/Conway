@@ -16,7 +16,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y nasm
 
     - name: Build
-      run: make linux
+      run: make
 
     - name: Run hello example
       run: ./bin/conway examples/hello.elf
@@ -32,14 +32,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install NASM
-      run: choco install nasm -y
+    - name: Install NASM and MinGW
+      run: choco install nasm mingw -y
 
     - name: Add NASM to PATH
       run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
     - name: Build
-      run: .\build.bat
+      run: .\build-mingw.bat
 
     - name: Run hello example
       run: .\bin\conway.exe examples\hello.elf
