@@ -45,12 +45,22 @@ build-mingw.bat
 ## Usage
 
 ```
-./bin/conway examples/hello.elf
+conway [options] <riscv_elf>
 ```
 
-Output:
+Options:
+
+| Flag | What |
+|------|------|
+| `-h`, `--help` | Show usage |
+| `-v`, `--verbose` | Print loader and execution details |
+| `--max-blocks N` | Stop after translating N blocks (0 = unlimited) |
+| `--dump-regs` | Print register file after execution |
+
+Example:
 
 ```
+$ ./bin/conway examples/hello.elf
 Conway - RISC-V to x86-64 Binary Translator
 Hello from RISC-V!
 ```
