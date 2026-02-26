@@ -76,7 +76,23 @@ static void *read_file(const char *path, size_t *out_size)
 /* ---- Banner & usage ---- */
 
 static const char banner[] = "Conway - RISC-V to x86-64 Binary Translator\n";
-static const char usage[]  = "Usage: conway [--help] <riscv_elf>\n";
+static const char usage[] =
+    "Usage: conway [options] <riscv_elf>\n"
+    "\n"
+    "Options:\n"
+    "  -h, --help          Show this message\n"
+    "  -v, --verbose       Print loader and execution details\n"
+    "  --max-blocks N      Stop after translating N blocks (0 = unlimited)\n"
+    "  --dump-regs         Print register file after execution\n";
+
+/* ---- RISC-V ABI register names ---- */
+
+static const char *rv_reg_names[32] = {
+    "zero", "ra", "sp",  "gp",  "tp", "t0", "t1", "t2",
+    "s0",   "s1", "a0",  "a1",  "a2", "a3", "a4", "a5",
+    "a6",   "a7", "s2",  "s3",  "s4", "s5", "s6", "s7",
+    "s8",   "s9", "s10", "s11", "t3", "t4", "t5", "t6"
+};
 
 /* ---- Entry point ---- */
 
@@ -85,12 +101,38 @@ int main(int argc, char **argv)
     fputs(banner, stdout);
     fflush(stdout);
 
+    /* Options */
+    int verbose = 0;
+    int dump_regs = 0;
+    uint64_t max_blocks = 0;
+
     /* Parse args */
     const char *elf_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fputs(usage, stdout);
             return 0;
+        }
+        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+            verbose = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--dump-regs") == 0) {
+            dump_regs = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--max-blocks") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --max-blocks requires a number\n");
+                return 1;
+            }
+            max_blocks = (uint64_t)strtoull(argv[++i], NULL, 0);
+            continue;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
+            fputs(usage, stderr);
+            return 1;
         }
         if (!elf_path) {
             elf_path = argv[i];
@@ -112,6 +154,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: could not open '%s'\n", elf_path);
         return 2;
     }
+    if (verbose)
+        fprintf(stdout, "Loaded %s (%llu bytes)\n", elf_path, (unsigned long long)elf_size);
 
     /* Allocate guest memory */
     void *guest = alloc_guest(CONWAY_GUEST_MEM_SIZE);
@@ -121,6 +165,9 @@ int main(int argc, char **argv)
         free(elf_data);
         return 3;
     }
+    if (verbose)
+        fprintf(stdout, "Guest memory: %u MB at %p\n",
+                CONWAY_GUEST_MEM_SIZE / (1024 * 1024), guest);
 
     /* Platform init (sets up stdout handle for asm syscall layer) */
     plat_init();
@@ -132,6 +179,16 @@ int main(int argc, char **argv)
     if (rc != 0) {
         fprintf(stderr, "Error: invalid ELF file (loader returned %d)\n", rc);
         return 4;
+    }
+    if (verbose) {
+        fprintf(stdout, "ELF entry:    0x%llx\n", (unsigned long long)elf_entry_point);
+        fprintf(stdout, "ELF load base: 0x%llx\n", (unsigned long long)elf_load_base);
+        fprintf(stdout, "ELF brk base:  0x%llx\n", (unsigned long long)elf_brk_base);
+        if (elf_tls_memsz)
+            fprintf(stdout, "TLS segment:   vaddr=0x%llx memsz=%llu filesz=%llu\n",
+                    (unsigned long long)elf_tls_vaddr,
+                    (unsigned long long)elf_tls_memsz,
+                    (unsigned long long)elf_tls_filesz);
     }
 
     /* Init block cache */
@@ -156,11 +213,31 @@ int main(int argc, char **argv)
         rv_regs[4] = elf_tls_vaddr;
     }
 
-    fprintf(stdout, "ELF loaded, starting execution...\n");
+    if (verbose) {
+        fprintf(stdout, "sp = 0x%llx\n", (unsigned long long)rv_regs[2]);
+        if (elf_tls_memsz)
+            fprintf(stdout, "tp = 0x%llx\n", (unsigned long long)rv_regs[4]);
+        if (max_blocks)
+            fprintf(stdout, "max blocks = %llu\n", (unsigned long long)max_blocks);
+        fprintf(stdout, "Starting execution...\n");
+    }
+    fflush(stdout);
 
     /* Run the translator */
     execute_blocks(elf_entry_point, guest, rv_regs,
-                   &rv_pc, 0, rv_fp_regs);
+                   &rv_pc, max_blocks, rv_fp_regs);
+
+    /* Dump registers if requested */
+    if (dump_regs) {
+        fprintf(stdout, "\n--- Register file ---\n");
+        fprintf(stdout, "pc  = 0x%016llx\n", (unsigned long long)rv_pc);
+        for (int i = 0; i < 32; i++) {
+            fprintf(stdout, "x%-2d (%4s) = 0x%016llx",
+                    i, rv_reg_names[i], (unsigned long long)rv_regs[i]);
+            if (i % 2 == 1) fprintf(stdout, "\n");
+            else             fprintf(stdout, "    ");
+        }
+    }
 
     /* a0 (x10) is the RISC-V return value */
     return (int)(rv_regs[10] & 0xFF);

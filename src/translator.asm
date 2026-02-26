@@ -12697,6 +12697,10 @@ execute_blocks:
 ; a0 = exit code
 ;------------------------------------------------------------------------------
 .syscall_exit:
+    ; Exit code is already in rv_regs[10] (a0) for the C wrapper.
+    ; Skip the debug stats dump and return cleanly.
+    jmp .done
+
     mov edi, [rbx + 10*8]       ; a0 = exit code
 
     ; DEBUG: Print exit code (DISABLED)
@@ -13627,15 +13631,9 @@ execute_blocks:
     add rsp, 48
     pop rdi
 
-%ifdef WINDOWS
-    sub rsp, 40
-    mov ecx, edi
-    call ExitProcess
-%else
-    ; Linux: syscall exit(status)
-    mov eax, 60                 ; SYS_exit
-    syscall
-%endif
+    ; Return to C wrapper instead of killing the process.
+    ; Exit code is already in rv_regs[10] (a0) for main.c to read.
+    jmp .done
 
 ;------------------------------------------------------------------------------
 ; read(fd, buf, count) - syscall 63
@@ -15077,7 +15075,7 @@ execute_blocks:
     pop r13
     pop r12
     pop rbx
-    add rsp, 80
+    add rsp, 96                     ; must match sub rsp, 96 at entry
     pop rbp
     ret
 
