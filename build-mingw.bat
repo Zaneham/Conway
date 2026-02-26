@@ -30,10 +30,17 @@ REM Create directories
 if not exist obj mkdir obj
 if not exist bin mkdir bin
 
+echo Compiling C...
+gcc -Wall -Wextra -O2 -Iinclude -c -o obj/main.obj src/main.c
+if errorlevel 1 (
+    echo ERROR: Failed to compile main.c
+    exit /b 1
+)
+
 echo Assembling...
 
-REM Assemble each source file
-for %%f in (entry_win.asm translator.asm elf_loader.asm platform_win.asm) do (
+REM Assemble each source file (no entry_win.asm -- replaced by main.c)
+for %%f in (translator.asm elf_loader.asm platform_win.asm) do (
     echo   %%f
     nasm -f win64 -g -DWINDOWS -Iinclude/ -o obj/%%~nf.obj src/%%f
     if errorlevel 1 (
@@ -43,7 +50,7 @@ for %%f in (entry_win.asm translator.asm elf_loader.asm platform_win.asm) do (
 )
 
 echo Linking with GCC...
-gcc -o bin/conway.exe obj/entry_win.obj obj/translator.obj obj/elf_loader.obj obj/platform_win.obj -nostdlib -lkernel32 -lshell32
+gcc -o bin/conway.exe obj/main.obj obj/translator.obj obj/elf_loader.obj obj/platform_win.obj -lkernel32
 
 if errorlevel 1 (
     echo ERROR: Linking failed

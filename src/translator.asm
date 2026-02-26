@@ -12563,11 +12563,11 @@ execute_blocks:
     ; Get syscall number from a7 (x17)
     mov rax, [rbx + 17*8]
 
-    ; Debug: Print all syscalls (DISABLED)
+    ; Debug: Print all syscalls (ENABLED for debugging)
     push rax
     inc qword [syscall_count]
     ; Print first N syscalls (0 = disable, or set high to print all)
-    jmp .skip_syscall_print  ; DISABLED
+    ; jmp .skip_syscall_print  ; DISABLED - ENABLED FOR DEBUGGING
     ; Print all syscalls (no limit)
     mov rcx, [syscall_count]
     cmp rcx, 99999999

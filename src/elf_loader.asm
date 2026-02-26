@@ -101,6 +101,8 @@ section .text
     global get_elf_brk_base
     global elf_tls_base
     global elf_tls_memsz
+    global elf_tls_filesz
+    global elf_tls_vaddr
     global elf_phoff
     global elf_phentsize
     global elf_phnum

@@ -26,6 +26,9 @@ extern load_elf
 extern elf_entry_point
 extern elf_load_base
 extern elf_brk_base
+extern elf_tls_memsz
+extern elf_tls_filesz
+extern elf_tls_vaddr
 
 ; Translator functions
 extern init_block_cache
@@ -273,6 +276,23 @@ main:
     mov rax, [guest_mem]
     add rax, GUEST_MEM_SIZE - 4096  ; Leave some headroom
     mov [rv_regs + 2*8], rax        ; x2 = sp
+
+    ;==========================================================================
+    ; TLS Setup (x4/tp) - Thread-local storage for glibc/OCaml
+    ; RISC-V ABI: tp (x4) points to the TLS block
+    ; ELF loader already placed TLS at elf_tls_base (= elf_tls_vaddr)
+    ;==========================================================================
+
+    ; Check if binary has TLS segment
+    mov rax, [elf_tls_memsz]
+    test rax, rax
+    jz .no_tls                      ; No TLS, skip setup
+
+    ; Set tp (x4) = TLS base address (already set by ELF loader)
+    mov rax, [elf_tls_vaddr]
+    mov [rv_regs + 4*8], rax        ; x4 = tp
+
+.no_tls:
 
     ; Execute translated blocks
     ; execute_blocks(start_pc, guest_mem, rv_regs, &rv_pc, max_blocks, fp_regs)
