@@ -8,7 +8,7 @@ Named after Lynn Conway, who invented dynamic instruction scheduling. This proje
 
 Conway loads a RISC-V ELF binary, translates it to native x86-64 machine code at runtime, and executes it. No interpreter loop. No LLVM. No compiler in the middle making decisions you didn't ask for.
 
-It passes 100% of the official RISC-V compliance tests. QEMU does not, but I'm sure they have their reasons.
+It passes 100% of the official RISC-V compliance tests. Which is quite nifty really.
 
 ## What It Runs On
 
